@@ -6,25 +6,16 @@ class AuthService:
     def __init__(self, repo: UserRepository):
         self.repo = repo
 
-    def authenticate(self, username: str, password: str):
+    def login(self, username: str, password: str):
         user = self.repo.get_by_username(username)
 
         if user is None:
-            return {
-                "success": False,
-                "status": 401,
-                "message": "Invalid credentials"
-            }
+            return False
 
-        if user.password != password:
-            return {
-                "success": False,
-                "status": 401,
-                "message": "Invalid credentials"
-            }
+        return user.password == password
 
+    def logout(self, username: str):
         return {
             "success": True,
-            "status": 200,
-            "message": "Login successful"
+            "message": f"{username} logged out"
         }
