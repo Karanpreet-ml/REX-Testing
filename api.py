@@ -13,5 +13,8 @@ repo.save(
 
 service = AuthService(repo)
 
-print(service.login("john", "secret"))
-print(service.logout("john"))
+result = service.login("john", "secret")
+print(result)
+
+new_result = service.authenticate_user("john", "secret")
+print(new_result)
