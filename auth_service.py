@@ -6,16 +6,9 @@ class AuthService:
     def __init__(self, repo: UserRepository):
         self.repo = repo
 
-    def login(self, username: str, password: str):
-        user = self.repo.get_by_username(username)
-
-        if user is None:
-            return False
-
-        return user.password == password
-
-    def logout(self, username: str):
+    # logout renamed
+    def sign_out(self, username: str):
         return {
             "success": True,
-            "message": f"{username} logged out"
+            "message": f"{username} signed out"
         }
