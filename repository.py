@@ -1,10 +1,12 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 class User:
     def __init__(self, username, password):
         self.username = username
         self.password = password
+        self.failed_attempts = 0
+        self.locked_until = None
 
 
 class UserRepository:
