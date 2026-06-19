@@ -5,14 +5,21 @@ class User:
     def __init__(self, username, password):
         self.username = username
         self.password = password
+        self.created_at = datetime.utcnow()
 
 
 class UserRepository:
     def __init__(self):
         self.users = {}
 
+    def save(self, user):
+        self.users[user.username] = user
+
     def get_by_username(self, username):
         return self.users.get(username)
 
-    def save(self, user):
-        self.users[user.username] = user
+    def exists(self, username):
+        return username in self.users
+
+    def count(self):
+        return len(self.users)

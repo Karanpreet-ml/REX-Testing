@@ -1,12 +1,32 @@
-from repository import UserRepository
+from repository import UserRepository, User
 from auth_service import AuthService
 
 
 repo = UserRepository()
+
+repo.save(
+    User(
+        username="john",
+        password="secret"
+    )
+)
+
 service = AuthService(repo)
 
-profile = service.get_profile("john")
-print(profile.username)
+login_result = service.login(
+    "john",
+    "secret"
+)
 
-name = service.get_profile_name("john")
-print(name)
+print(login_result)
+
+is_valid = service.validate_credentials(
+    "john",
+    "secret"
+)
+
+print(is_valid)
+
+print(
+    service.health_check()
+)
