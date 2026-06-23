@@ -19,3 +19,5 @@ print(
 print(
     service.health_check()
 )
+
+print("Login attempt with correct credentials:")
