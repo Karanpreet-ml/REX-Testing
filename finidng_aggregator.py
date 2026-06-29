@@ -2,7 +2,7 @@
 Finding aggregator — collects, deduplicates and enriches raw findings
 before handing them to the risk engine.
 
-Currently does NOT pass churn metadata into the scorer (REX-841 fix required).
+REX-841: wires churn from AggregationRequest into ReviewContext.
 """
 
 from __future__ import annotations
@@ -26,14 +26,14 @@ _engine = RiskEngine()
 
 @dataclass
 class AgentFinding:
-    agent: str             # logic | quality | performance | security
+    agent: str
     severity: str
     category: str
     file_path: str
     line_number: int
     message: str
     tool_source: str
-    fingerprint: Optional[str] = None  # set by aggregator
+    fingerprint: Optional[str] = None
 
     def compute_fingerprint(self) -> str:
         key = f"{self.file_path}:{self.line_number}:{self.category}:{self.message[:60]}"
@@ -41,7 +41,7 @@ class AgentFinding:
 
 
 # ---------------------------------------------------------------------------
-# Aggregation context — what the pipeline passes in
+# Aggregation context
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -51,7 +51,6 @@ class AggregationRequest:
     changed_files: list[FileContext]
     jira_ticket_key: Optional[str] = None
     jira_labels: Optional[list[str]] = None
-    # NOTE: code_changes (churn) is NOT yet wired into scoring — REX-841
     code_changes: Optional[ChurnMetadata] = None
 
 
@@ -69,7 +68,6 @@ class AggregationResult:
 # ---------------------------------------------------------------------------
 
 def _deduplicate(findings: list[AgentFinding]) -> tuple[list[AgentFinding], int]:
-    """Remove duplicate findings based on fingerprint. Keep first occurrence."""
     seen: set[str] = set()
     unique: list[AgentFinding] = []
     for f in findings:
@@ -96,20 +94,15 @@ def _to_finding_input(af: AgentFinding) -> FindingInput:
 # ---------------------------------------------------------------------------
 
 class FindingAggregator:
-    """
-    Deduplicates agent findings and triggers risk analysis.
-
-    BUG (REX-841): code_changes in AggregationRequest is accepted but
-    never forwarded to score_review / RiskEngine, so churn-normalised
-    scoring is not active even when churn data is available.
-    """
+    """Aggregates agent findings and triggers risk analysis (REX-841)."""
 
     def aggregate(self, request: AggregationRequest) -> AggregationResult:
         unique_findings, dup_count = _deduplicate(request.agent_findings)
 
         logger.info(
             "Aggregator: review_id=%s total=%d unique=%d duplicates=%d",
-            request.review_id, len(request.agent_findings), len(unique_findings), dup_count,
+            request.review_id, len(request.agent_findings),
+            len(unique_findings), dup_count,
         )
 
         finding_inputs = [_to_finding_input(f) for f in unique_findings]
@@ -123,9 +116,15 @@ class FindingAggregator:
             findings=finding_inputs,
             changed_files=request.changed_files,
             jira_ticket_key=request.jira_ticket_key,
-            jira_labels=request.jira_labels,
-            # churn NOT passed here — this is the REX-841 gap
+            jira_labels=request.jira_labels or [],
         )
+
+        # BUG-3: churn_override is not a field on ReviewContext dataclass.
+        # RiskEngine reads ctx.churn (a @property), never churn_override.
+        # This assignment is silently accepted by Python but has zero effect —
+        # churn data never reaches the scorer. REX-841 churn fix is a no-op.
+        if request.code_changes:
+            review_ctx.churn_override = request.code_changes
 
         risk_report = _engine.compute_risk_signals(review_ctx)
 

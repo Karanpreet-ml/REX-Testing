@@ -2,12 +2,10 @@
 AI Risk signal detection engine.
 
 Analyses a completed review to flag known failure modes:
-  - hallucination_call  : finding references a function that does not exist in the diff
-  - dead_abstraction    : a helper is defined but never invoked in the changed files
-  - defensive_mismatch  : error-handling pattern differs across related changed files
-  - cross_file_consistency : type/contract used in file A conflicts with definition in file B
-
-These signals are purely heuristic — they surface candidates for human review.
+  - hallucination_call  : finding references a function not in the diff
+  - dead_abstraction    : helper defined but never invoked in changed files
+  - defensive_mismatch  : error-handling pattern differs across changed files
+  - cross_file_consistency : type/contract conflicts across files
 """
 
 from __future__ import annotations
@@ -29,7 +27,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class FileContext:
     path: str
-    content: str           # full text of the changed file
+    content: str
     added_lines: int = 0
     deleted_lines: int = 0
 
@@ -40,7 +38,9 @@ class ReviewContext:
     findings: list[FindingInput]
     changed_files: list[FileContext]
     jira_ticket_key: Optional[str] = None
-    jira_labels: Optional[list[str]] = None
+    # REX-841: changed from Optional[list[str]] to list[str]
+    # BUG-7 (cross_file_consistency): review_pipeline.py still passes Optional[list[str]]
+    jira_labels: list[str] = field(default_factory=list)
 
     @property
     def churn(self) -> ChurnMetadata:
@@ -53,7 +53,7 @@ class ReviewContext:
 
 @dataclass
 class RiskSignal:
-    signal_type: str       # hallucination_call | dead_abstraction | ...
+    signal_type: str
     description: str
     affected_file: Optional[str] = None
     severity: str = "medium"
@@ -76,15 +76,10 @@ class RiskReport:
 # ---------------------------------------------------------------------------
 
 def _detect_hallucination_calls(ctx: ReviewContext) -> list[RiskSignal]:
-    """
-    Flag any finding whose message references a function name that cannot be
-    found in any of the changed files.
-    """
     signals: list[RiskSignal] = []
     all_content = "\n".join(fc.content for fc in ctx.changed_files)
 
     for finding in ctx.findings:
-        # Look for "function_name(" patterns in the finding message
         refs = re.findall(r"\b([a-z_][a-z0-9_]*)\s*\(", finding.message.lower())
         for ref in refs:
             if ref in {"if", "for", "while", "return", "raise", "print", "len", "str", "int"}:
@@ -101,10 +96,6 @@ def _detect_hallucination_calls(ctx: ReviewContext) -> list[RiskSignal]:
 
 
 def _detect_dead_abstractions(ctx: ReviewContext) -> list[RiskSignal]:
-    """
-    Flag helper functions defined in changed files that are never called
-    within those same files.
-    """
     signals: list[RiskSignal] = []
     all_content = "\n".join(fc.content for fc in ctx.changed_files)
 
@@ -113,7 +104,7 @@ def _detect_dead_abstractions(ctx: ReviewContext) -> list[RiskSignal]:
         for fn_name in defined:
             call_pattern = rf"\b{re.escape(fn_name)}\s*\("
             call_count = len(re.findall(call_pattern, all_content))
-            if call_count <= 1:  # only the definition itself
+            if call_count <= 1:
                 signals.append(RiskSignal(
                     signal_type="dead_abstraction",
                     description=f"Private helper '{fn_name}' defined but never called in changed files",
@@ -124,10 +115,6 @@ def _detect_dead_abstractions(ctx: ReviewContext) -> list[RiskSignal]:
 
 
 def _detect_defensive_mismatch(ctx: ReviewContext) -> list[RiskSignal]:
-    """
-    Flag if some changed files use try/except and others with similar
-    patterns do not, suggesting inconsistent error handling.
-    """
     signals: list[RiskSignal] = []
     if len(ctx.changed_files) < 2:
         return signals
@@ -149,10 +136,6 @@ def _detect_defensive_mismatch(ctx: ReviewContext) -> list[RiskSignal]:
 
 
 def _detect_cross_file_consistency(ctx: ReviewContext) -> list[RiskSignal]:
-    """
-    Flag if a type/constant name appears with different casing or value
-    across changed files, suggesting a contract mismatch.
-    """
     signals: list[RiskSignal] = []
     constant_pattern = re.compile(r"^([A-Z_]{3,})\s*=\s*(.+)$", re.MULTILINE)
 
@@ -184,15 +167,13 @@ def _detect_cross_file_consistency(ctx: ReviewContext) -> list[RiskSignal]:
 # ---------------------------------------------------------------------------
 
 class RiskEngine:
-    """
-    Orchestrates signal detection and scoring for a review context.
-    """
-
     def compute_risk_signals(self, ctx: ReviewContext) -> RiskReport:
         score = score_review(
             findings=ctx.findings,
             churn=ctx.churn,
-            jira_labels=ctx.jira_labels,
+            # BUG-4: jira_labels is now list[str] (never None), but this guard
+            # passes None to scorer when the list is empty — dead guard + wrong behaviour
+            jira_labels=ctx.jira_labels if ctx.jira_labels else None,
         )
 
         signals: list[RiskSignal] = []
