@@ -1,12 +1,9 @@
 """
-Review pipeline — top-level orchestrator that runs all four agents
-and collects their findings into the aggregator.
+Review pipeline — REX-857.
 
-Agents:
-  LogicAgent      → logic / correctness findings
-  QualityAgent    → code quality / style findings
-  PerformanceAgent → performance / complexity findings
-  SecurityAgent   → security / vulnerability findings
+Agents now attach a confidence score to each finding.
+PipelineResult exposes suppressed_count from aggregation.
+_format_agent_label() removed — moved to finding_aggregator.py.
 """
 
 from __future__ import annotations
@@ -42,17 +39,13 @@ class BaseAgent:
 
 
 # ---------------------------------------------------------------------------
-# Agent implementations (stubs — real logic lives in LLM prompts)
+# Agent implementations
 # ---------------------------------------------------------------------------
 
 class LogicAgent(BaseAgent):
     name = "logic"
 
     def run(self, files: list[FileContext], context: dict) -> list[AgentFinding]:
-        """
-        Analyses control-flow correctness, off-by-one errors, missing
-        null checks, and invariant violations.
-        """
         findings: list[AgentFinding] = []
         for fc in files:
             if "if " in fc.content and "else" not in fc.content:
@@ -62,8 +55,9 @@ class LogicAgent(BaseAgent):
                     category="logic",
                     file_path=fc.path,
                     line_number=1,
-                    message="Conditional branch detected without else clause — possible unhandled path",
+                    message="Conditional branch without else — possible unhandled path",
                     tool_source="logic_agent_v1",
+                    confidence=0.80,
                 ))
         return findings
 
@@ -72,10 +66,6 @@ class QualityAgent(BaseAgent):
     name = "quality"
 
     def run(self, files: list[FileContext], context: dict) -> list[AgentFinding]:
-        """
-        Analyses code style, naming conventions, complexity, and
-        documentation coverage.
-        """
         findings: list[AgentFinding] = []
         for fc in files:
             if len(fc.content.splitlines()) > 300:
@@ -85,8 +75,9 @@ class QualityAgent(BaseAgent):
                     category="style",
                     file_path=fc.path,
                     line_number=1,
-                    message="File exceeds 300 lines — consider splitting into smaller modules",
+                    message="File exceeds 300 lines — consider splitting",
                     tool_source="quality_agent_v1",
+                    confidence=0.90,
                 ))
         return findings
 
@@ -95,10 +86,6 @@ class PerformanceAgent(BaseAgent):
     name = "performance"
 
     def run(self, files: list[FileContext], context: dict) -> list[AgentFinding]:
-        """
-        Analyses algorithmic complexity, N+1 query patterns, unnecessary
-        re-computation, and memory allocation hotspots.
-        """
         findings: list[AgentFinding] = []
         for fc in files:
             if fc.content.count("for ") > 3:
@@ -108,8 +95,9 @@ class PerformanceAgent(BaseAgent):
                     category="performance",
                     file_path=fc.path,
                     line_number=1,
-                    message="Multiple nested loops detected — review algorithmic complexity",
+                    message="Multiple nested loops — review algorithmic complexity",
                     tool_source="performance_agent_v1",
+                    confidence=0.72,
                 ))
         return findings
 
@@ -118,10 +106,6 @@ class SecurityAgent(BaseAgent):
     name = "security"
 
     def run(self, files: list[FileContext], context: dict) -> list[AgentFinding]:
-        """
-        Analyses for injection vulnerabilities, hardcoded secrets,
-        insecure deserialization, and auth bypass patterns.
-        """
         findings: list[AgentFinding] = []
         dangerous_patterns = ["eval(", "exec(", "pickle.loads(", "shell=True"]
         for fc in files:
@@ -135,6 +119,7 @@ class SecurityAgent(BaseAgent):
                         line_number=1,
                         message=f"Dangerous pattern detected: {pattern}",
                         tool_source="security_agent_v1",
+                        confidence=0.95,
                     ))
         return findings
 
@@ -159,6 +144,7 @@ class PipelineResult:
     aggregation: AggregationResult
     duration_seconds: float
     agents_run: list[str]
+    suppressed_count: int = 0        # REX-857: surfaced from aggregation
 
 
 # ---------------------------------------------------------------------------
@@ -174,12 +160,6 @@ _AGENTS: list[BaseAgent] = [
 
 
 class ReviewPipeline:
-    """
-    Runs all agents in sequence and aggregates findings.
-
-    Future: parallelise with asyncio.gather for latency reduction (REX-850).
-    """
-
     def run(self, request: PipelineRequest) -> PipelineResult:
         start = time.monotonic()
         all_findings: list[AgentFinding] = []
@@ -209,4 +189,5 @@ class ReviewPipeline:
             aggregation=aggregation,
             duration_seconds=round(duration, 3),
             agents_run=[a.name for a in _AGENTS],
+            suppressed_count=aggregation.suppressed_count,
         )
