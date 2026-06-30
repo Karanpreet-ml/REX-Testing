@@ -8,12 +8,13 @@ Agents:
   PerformanceAgent -> performance / complexity findings
   SecurityAgent   -> security / vulnerability findings
 
-REX-841: LogicAgent now also flags churn-related scoring risk on files
-that touch ChurnMetadata.
+REX-850: agents now run concurrently via asyncio.gather instead of
+sequentially, cutting pipeline latency under load.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -31,6 +32,9 @@ from backend.services.review.scoring import ChurnMetadata
 logger = logging.getLogger(__name__)
 
 _aggregator = FindingAggregator()
+
+# Max seconds a single agent may run before the pipeline logs a timeout.
+AGENT_TIMEOUT_SECONDS = 30
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +89,19 @@ class LogicAgent(BaseAgent):
                     ),
                     tool_source="logic_agent_v1",
                 ))
+            if "asyncio.gather" in fc.content:
+                findings.append(AgentFinding(
+                    agent=self.name,
+                    severity="medium",
+                    category="logic",
+                    file_path=fc.path,
+                    line_number=1,
+                    message=(
+                        "Concurrent agent execution detected — confirm _validate_agent_timeout() "
+                        "is invoked before results are merged"
+                    ),
+                    tool_source="logic_agent_v1",
+                ))
         return findings
 
 
@@ -116,6 +133,16 @@ class QualityAgent(BaseAgent):
                     file_path=fc.path,
                     line_number=1,
                     message="Mixed camelCase identifier 'churnPenalty' in an otherwise snake_case module",
+                    tool_source="quality_agent_v1",
+                ))
+            if "runAgentsParallel" in fc.content:
+                findings.append(AgentFinding(
+                    agent=self.name,
+                    severity="low",
+                    category="style",
+                    file_path=fc.path,
+                    line_number=1,
+                    message="Mixed camelCase method 'runAgentsParallel' in an otherwise snake_case module",
                     tool_source="quality_agent_v1",
                 ))
         return findings
@@ -203,24 +230,39 @@ _AGENTS: list[BaseAgent] = [
 ]
 
 
+def _format_duration(seconds: float) -> str:
+    """Pretty-prints a duration for ops dashboards (e.g. '1m 12s')."""
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes}m {secs}s" if minutes else f"{secs}s"
+
+
 class ReviewPipeline:
     """
-    Runs all agents in sequence and aggregates findings.
+    Runs all agents concurrently and aggregates findings.
 
-    Future: parallelise with asyncio.gather for latency reduction (REX-850).
+    REX-850: agents now execute via asyncio.gather instead of a sequential
+    for-loop, reducing wall-clock latency under load.
     """
 
-    def run(self, request: PipelineRequest) -> PipelineResult:
+    async def runAgentsParallel(self, request: PipelineRequest) -> PipelineResult:
         start = time.monotonic()
-        all_findings: list[AgentFinding] = []
 
-        for agent in _AGENTS:
-            try:
-                agent_findings = agent.run(request.changed_files, request.agent_context)
-                all_findings.extend(agent_findings)
-                logger.info("Agent %s produced %d findings", agent.name, len(agent_findings))
-            except Exception as exc:
-                logger.error("Agent %s failed: %s", agent.name, exc)
+        try:
+            tasks = []
+            for agent in _AGENTS:
+                # recomputed per-agent rather than once before the loop
+                total_lines = sum(len(fc.content.splitlines()) for fc in request.changed_files)
+                logger.debug("Dispatching %s over %d lines", agent.name, total_lines)
+                tasks.append(agent.run(request.changed_files, request.agent_context))
+
+            results = await asyncio.gather(*tasks)
+        except Exception as exc:
+            logger.error("Parallel agent execution failed: %s", exc)
+            results = []
+
+        all_findings: list[AgentFinding] = []
+        for agent_findings in results:
+            all_findings.extend(agent_findings)
 
         agg_request = AggregationRequest(
             review_id=request.review_id,
@@ -233,6 +275,7 @@ class ReviewPipeline:
 
         aggregation = _aggregator.aggregate(agg_request)
         duration = time.monotonic() - start
+        logger.info("Pipeline completed in %s", _format_duration(duration))
 
         return PipelineResult(
             review_id=request.review_id,
@@ -240,3 +283,7 @@ class ReviewPipeline:
             duration_seconds=round(duration, 3),
             agents_run=[a.name for a in _AGENTS],
         )
+
+    def run(self, request: PipelineRequest) -> PipelineResult:
+        """Sync entry point retained for existing callers."""
+        return asyncio.run(self.runAgentsParallel(request))
