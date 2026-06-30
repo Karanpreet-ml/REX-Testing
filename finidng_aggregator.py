@@ -1,8 +1,7 @@
 """
-Finding aggregator — collects, deduplicates and enriches raw findings
-before handing them to the risk engine.
+Finding aggregator — REX-863.
 
-REX-841: wires churn from AggregationRequest into ReviewContext.
+Writes result to ReviewCache after aggregation on cache miss.
 """
 
 from __future__ import annotations
@@ -14,14 +13,18 @@ from typing import Optional
 
 from backend.services.review.scoring import FindingInput, ChurnMetadata
 from backend.services.review.risk_engine import FileContext, ReviewContext, RiskReport, RiskEngine
+from backend.services.review.agent_config import AgentConfig, load_all_agent_configs
+from backend.services.review.review_cache import ReviewCache
+from backend.services.review.settings import load_cache_config
 
 logger = logging.getLogger(__name__)
 
 _engine = RiskEngine()
+_cache = ReviewCache(load_cache_config())
 
 
 # ---------------------------------------------------------------------------
-# Raw finding from individual agents
+# Data classes
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -33,16 +36,13 @@ class AgentFinding:
     line_number: int
     message: str
     tool_source: str
+    confidence: float = 1.0
     fingerprint: Optional[str] = None
 
     def compute_fingerprint(self) -> str:
         key = f"{self.file_path}:{self.line_number}:{self.category}:{self.message[:60]}"
         return hashlib.md5(key.encode()).hexdigest()[:12]
 
-
-# ---------------------------------------------------------------------------
-# Aggregation context
-# ---------------------------------------------------------------------------
 
 @dataclass
 class AggregationRequest:
@@ -59,8 +59,29 @@ class AggregationResult:
     review_id: int
     deduplicated_findings: list[FindingInput]
     duplicate_count: int
+    suppressed_count: int
     risk_report: RiskReport
     agent_breakdown: dict[str, int] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Suppression
+# ---------------------------------------------------------------------------
+
+def _suppress_low_confidence(
+    findings: list[AgentFinding],
+    configs: dict[str, AgentConfig],
+) -> tuple[list[AgentFinding], int]:
+    kept: list[AgentFinding] = []
+    dropped = 0
+    for f in findings:
+        cfg = configs.get(f.agent)
+        if cfg and cfg.should_suppress(f.confidence):
+            logger.debug("Suppressed %s finding from %s (conf=%.2f)", f.category, f.agent, f.confidence)
+            dropped += 1
+        else:
+            kept.append(f)
+    return kept, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -94,15 +115,25 @@ def _to_finding_input(af: AgentFinding) -> FindingInput:
 # ---------------------------------------------------------------------------
 
 class FindingAggregator:
-    """Aggregates agent findings and triggers risk analysis (REX-841)."""
+    """Aggregates findings and writes result to cache on miss."""
 
-    def aggregate(self, request: AggregationRequest) -> AggregationResult:
-        unique_findings, dup_count = _deduplicate(request.agent_findings)
+    def aggregate(
+        self,
+        request: AggregationRequest,
+        cache_key: Optional[str] = None,
+    ) -> AggregationResult:
+        agent_names = list({f.agent for f in request.agent_findings})
+        configs = load_all_agent_configs(agent_names)
+
+        surviving, suppressed_count = _suppress_low_confidence(
+            request.agent_findings, configs
+        )
+        unique_findings, dup_count = _deduplicate(surviving)
 
         logger.info(
-            "Aggregator: review_id=%s total=%d unique=%d duplicates=%d",
+            "Aggregator: review_id=%s total=%d suppressed=%d unique=%d duplicates=%d",
             request.review_id, len(request.agent_findings),
-            len(unique_findings), dup_count,
+            suppressed_count, len(unique_findings), dup_count,
         )
 
         finding_inputs = [_to_finding_input(f) for f in unique_findings]
@@ -119,19 +150,18 @@ class FindingAggregator:
             jira_labels=request.jira_labels or [],
         )
 
-        # BUG-3: churn_override is not a field on ReviewContext dataclass.
-        # RiskEngine reads ctx.churn (a @property), never churn_override.
-        # This assignment is silently accepted by Python but has zero effect —
-        # churn data never reaches the scorer. REX-841 churn fix is a no-op.
-        if request.code_changes:
-            review_ctx.churn_override = request.code_changes
-
         risk_report = _engine.compute_risk_signals(review_ctx)
 
-        return AggregationResult(
+        result = AggregationResult(
             review_id=request.review_id,
             deduplicated_findings=finding_inputs,
             duplicate_count=dup_count,
+            suppressed_count=suppressed_count,
             risk_report=risk_report,
             agent_breakdown=agent_breakdown,
         )
+
+        if cache_key is not None:
+            _cache.set(cache_key, result)
+
+        return result
