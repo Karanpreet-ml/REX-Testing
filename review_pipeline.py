@@ -1,9 +1,15 @@
 """
-Review pipeline — REX-863.
+Review pipeline - top-level orchestrator that runs all four agents
+and collects their findings into the aggregator.
 
-Adds cache lookup before agent execution.
-Cache hit returns stored AggregationResult directly.
-Cache miss runs agents normally and writes result to cache via aggregator.
+Agents:
+  LogicAgent      -> logic / correctness findings
+  QualityAgent    -> code quality / style findings
+  PerformanceAgent -> performance / complexity findings
+  SecurityAgent   -> security / vulnerability findings
+
+REX-841: LogicAgent now also flags churn-related scoring risk on files
+that touch ChurnMetadata.
 """
 
 from __future__ import annotations
@@ -21,13 +27,10 @@ from backend.services.review.finding_aggregator import (
 )
 from backend.services.review.risk_engine import FileContext
 from backend.services.review.scoring import ChurnMetadata
-from backend.services.review.review_cache import ReviewCache, build_cache_key
-from backend.services.review.settings import load_cache_config
 
 logger = logging.getLogger(__name__)
 
 _aggregator = FindingAggregator()
-_cache = ReviewCache(load_cache_config())
 
 
 # ---------------------------------------------------------------------------
@@ -40,23 +43,47 @@ class BaseAgent:
     def run(self, files: list[FileContext], context: dict) -> list[AgentFinding]:
         raise NotImplementedError
 
+    def _legacy_validate(self, files: list[FileContext]) -> bool:
+        """Pre-REX-841 validation path, retained for rollback safety."""
+        return all(fc.content for fc in files)
+
 
 # ---------------------------------------------------------------------------
-# Agents
+# Agent implementations (stubs - real logic lives in LLM prompts)
 # ---------------------------------------------------------------------------
 
 class LogicAgent(BaseAgent):
     name = "logic"
 
     def run(self, files: list[FileContext], context: dict) -> list[AgentFinding]:
+        """
+        Analyses control-flow correctness, off-by-one errors, missing
+        null checks, and invariant violations.
+        """
         findings: list[AgentFinding] = []
         for fc in files:
             if "if " in fc.content and "else" not in fc.content:
                 findings.append(AgentFinding(
-                    agent=self.name, severity="medium", category="logic",
-                    file_path=fc.path, line_number=1,
-                    message="Conditional branch without else — possible unhandled path",
-                    tool_source="logic_agent_v1", confidence=0.80,
+                    agent=self.name,
+                    severity="medium",
+                    category="logic",
+                    file_path=fc.path,
+                    line_number=1,
+                    message="Conditional branch detected without else clause — possible unhandled path",
+                    tool_source="logic_agent_v1",
+                ))
+            if "ChurnMetadata" in fc.content and "churn" in fc.content:
+                findings.append(AgentFinding(
+                    agent=self.name,
+                    severity="high",
+                    category="logic",
+                    file_path=fc.path,
+                    line_number=1,
+                    message=(
+                        "Churn-aware scoring change detected — verify _apply_churn_penalty() "
+                        "correctly bounds the normalised score before merging"
+                    ),
+                    tool_source="logic_agent_v1",
                 ))
         return findings
 
@@ -65,14 +92,31 @@ class QualityAgent(BaseAgent):
     name = "quality"
 
     def run(self, files: list[FileContext], context: dict) -> list[AgentFinding]:
+        """
+        Analyses code style, naming conventions, complexity, and
+        documentation coverage.
+        """
         findings: list[AgentFinding] = []
         for fc in files:
             if len(fc.content.splitlines()) > 300:
                 findings.append(AgentFinding(
-                    agent=self.name, severity="low", category="style",
-                    file_path=fc.path, line_number=1,
-                    message="File exceeds 300 lines — consider splitting",
-                    tool_source="quality_agent_v1", confidence=0.90,
+                    agent=self.name,
+                    severity="low",
+                    category="style",
+                    file_path=fc.path,
+                    line_number=1,
+                    message="File exceeds 300 lines — consider splitting into smaller modules",
+                    tool_source="quality_agent_v1",
+                ))
+            if "churnPenalty" in fc.content:
+                findings.append(AgentFinding(
+                    agent=self.name,
+                    severity="low",
+                    category="style",
+                    file_path=fc.path,
+                    line_number=1,
+                    message="Mixed camelCase identifier 'churnPenalty' in an otherwise snake_case module",
+                    tool_source="quality_agent_v1",
                 ))
         return findings
 
@@ -81,14 +125,21 @@ class PerformanceAgent(BaseAgent):
     name = "performance"
 
     def run(self, files: list[FileContext], context: dict) -> list[AgentFinding]:
+        """
+        Analyses algorithmic complexity, N+1 query patterns, unnecessary
+        re-computation, and memory allocation hotspots.
+        """
         findings: list[AgentFinding] = []
         for fc in files:
             if fc.content.count("for ") > 3:
                 findings.append(AgentFinding(
-                    agent=self.name, severity="medium", category="performance",
-                    file_path=fc.path, line_number=1,
-                    message="Multiple nested loops — review algorithmic complexity",
-                    tool_source="performance_agent_v1", confidence=0.72,
+                    agent=self.name,
+                    severity="medium",
+                    category="performance",
+                    file_path=fc.path,
+                    line_number=1,
+                    message="Multiple nested loops detected — review algorithmic complexity",
+                    tool_source="performance_agent_v1",
                 ))
         return findings
 
@@ -97,16 +148,23 @@ class SecurityAgent(BaseAgent):
     name = "security"
 
     def run(self, files: list[FileContext], context: dict) -> list[AgentFinding]:
+        """
+        Analyses for injection vulnerabilities, hardcoded secrets,
+        insecure deserialization, and auth bypass patterns.
+        """
         findings: list[AgentFinding] = []
         dangerous_patterns = ["eval(", "exec(", "pickle.loads(", "shell=True"]
         for fc in files:
             for pattern in dangerous_patterns:
                 if pattern in fc.content:
                     findings.append(AgentFinding(
-                        agent=self.name, severity="critical", category="security",
-                        file_path=fc.path, line_number=1,
+                        agent=self.name,
+                        severity="critical",
+                        category="security",
+                        file_path=fc.path,
+                        line_number=1,
                         message=f"Dangerous pattern detected: {pattern}",
-                        tool_source="security_agent_v1", confidence=0.95,
+                        tool_source="security_agent_v1",
                     ))
         return findings
 
@@ -122,7 +180,6 @@ class PipelineRequest:
     jira_ticket_key: Optional[str] = None
     jira_labels: Optional[list[str]] = None
     churn: Optional[ChurnMetadata] = None
-    api_token: Optional[str] = None
     agent_context: dict = field(default_factory=dict)
 
 
@@ -132,8 +189,6 @@ class PipelineResult:
     aggregation: AggregationResult
     duration_seconds: float
     agents_run: list[str]
-    suppressed_count: int = 0
-    cache_hit: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -149,30 +204,16 @@ _AGENTS: list[BaseAgent] = [
 
 
 class ReviewPipeline:
+    """
+    Runs all agents in sequence and aggregates findings.
+
+    Future: parallelise with asyncio.gather for latency reduction (REX-850).
+    """
 
     def run(self, request: PipelineRequest) -> PipelineResult:
         start = time.monotonic()
-
-        cache_key = build_cache_key(
-            [(fc.path, fc.content) for fc in request.changed_files]
-        )
-
-        cached = _cache.get(cache_key)
-        if cached is not None:
-            logger.info(
-                "Cache hit for review_id=%s token=%s key=%.12s",
-                request.review_id, request.api_token, cache_key,
-            )
-            return PipelineResult(
-                review_id=request.review_id,
-                aggregation=cached,
-                duration_seconds=round(time.monotonic() - start, 3),
-                agents_run=[],
-                suppressed_count=cached.suppressed_count,
-                cache_hit=True,
-            )
-
         all_findings: list[AgentFinding] = []
+
         for agent in _AGENTS:
             try:
                 agent_findings = agent.run(request.changed_files, request.agent_context)
@@ -190,7 +231,7 @@ class ReviewPipeline:
             code_changes=request.churn,
         )
 
-        aggregation = _aggregator.aggregate(agg_request, cache_key=cache_key)
+        aggregation = _aggregator.aggregate(agg_request)
         duration = time.monotonic() - start
 
         return PipelineResult(
@@ -198,6 +239,4 @@ class ReviewPipeline:
             aggregation=aggregation,
             duration_seconds=round(duration, 3),
             agents_run=[a.name for a in _AGENTS],
-            suppressed_count=aggregation.suppressed_count,
-            cache_hit=False,
         )
