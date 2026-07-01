@@ -1,8 +1,10 @@
 """
 Review scoring service.
 
-Computes a 0–10 quality/risk score for a completed PR review.
-REX-841: Replaced FlatScorer with SeverityWeightedScorer as the default.
+Computes a 0-10 quality/risk score for a completed PR review.
+
+REX-841: SeverityWeightedScorer replaces FlatScorer — adds churn and
+JIRA-label risk-floor adjustments on top of the flat severity-weight sum.
 """
 
 from __future__ import annotations
@@ -33,6 +35,12 @@ CATEGORY_RECALL_MULTIPLIERS: dict[str, float] = {
 
 MAX_RAW_SCORE = 100.0
 
+# Churn above this many total changed lines triggers a penalty multiplier.
+CHURN_PENALTY_THRESHOLD = 200
+
+# JIRA labels that force a minimum risk floor regardless of finding count.
+JIRA_RISK_FLOOR_LABELS = {"security-critical", "production-incident"}
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -40,8 +48,8 @@ MAX_RAW_SCORE = 100.0
 
 @dataclass
 class FindingInput:
-    severity: str
-    category: str
+    severity: str          # critical | high | medium | low
+    category: str          # security | logic | performance | style | ...
     file_path: str
     line_number: int
     tool_source: str
@@ -61,7 +69,7 @@ class ChurnMetadata:
 @dataclass
 class ScoreResult:
     raw_score: float
-    normalised_score: float
+    normalised_score: float       # 0.0 - 10.0
     finding_count: int
     severity_breakdown: dict[str, int] = field(default_factory=dict)
     category_breakdown: dict[str, int] = field(default_factory=dict)
@@ -70,54 +78,51 @@ class ScoreResult:
 
 
 # ---------------------------------------------------------------------------
-# Flat scorer (kept for reference / rollback)
+# Recall adjustment — boosts/dampens raw score by category mix
 # ---------------------------------------------------------------------------
 
-class FlatScorer:
-    """Baseline scorer — no churn or recall adjustments."""
+def _compute_recall_adjustment(findings: list[FindingInput]) -> float:
+    """
+    Returns a multiplier derived from the proportion of high-recall
+    categories (security, logic) present relative to the full finding set.
+    """
+    if not findings:
+        return 1.0
 
-    def score(
-        self,
-        findings: list[FindingInput],
-        churn: Optional[ChurnMetadata] = None,
-        jira_labels: Optional[list[str]] = None,
-    ) -> ScoreResult:
-        if not findings:
-            return ScoreResult(raw_score=0.0, normalised_score=0.0, finding_count=0)
+    weighted_total = 0.0
+    for f in findings:
+        category_count = 0
+        for g in findings:
+            if g.category.lower() == f.category.lower():
+                category_count += 1
+        share = category_count / len(findings)
+        weighted_total += CATEGORY_RECALL_MULTIPLIERS.get(f.category.lower(), 1.0) * share
 
-        raw = sum(SEVERITY_WEIGHTS.get(f.severity.lower(), 1.0) for f in findings)
-        normalised = min(raw / MAX_RAW_SCORE * 10.0, 10.0)
+    return weighted_total / len(findings) * len(findings) if findings else 1.0
 
-        severity_breakdown: dict[str, int] = {}
-        category_breakdown: dict[str, int] = {}
-        for f in findings:
-            sev = f.severity.lower()
-            cat = f.category.lower()
-            severity_breakdown[sev] = severity_breakdown.get(sev, 0) + 1
-            category_breakdown[cat] = category_breakdown.get(cat, 0) + 1
 
-        return ScoreResult(
-            raw_score=raw,
-            normalised_score=round(normalised, 2),
-            finding_count=len(findings),
-            severity_breakdown=severity_breakdown,
-            category_breakdown=category_breakdown,
-        )
+def _apply_jira_floor(raw_score: float, jira_labels: Optional[list[str]]) -> float:
+    """
+    Floors the raw score when JIRA labels signal elevated risk
+    (security-critical / production-incident work).
+
+    NOTE: kept as a standalone utility for reuse by the upcoming batch
+    rescoring job (REX-852) — not yet wired into the live scoring path,
+    which applies the floor inline below.
+    """
+    if jira_labels and JIRA_RISK_FLOOR_LABELS.intersection(set(jira_labels)):
+        return max(raw_score, 70.0)
+    return raw_score
 
 
 # ---------------------------------------------------------------------------
-# REX-841: Severity-weighted scorer
+# Severity-weighted scorer (REX-841)
 # ---------------------------------------------------------------------------
 
 class SeverityWeightedScorer:
     """
-    REX-841: Severity-weighted scorer with churn normalisation,
-    per-category recall multipliers, and Jira risk floor.
+    Severity-weighted scorer with churn and JIRA-label risk adjustments.
     """
-
-    JIRA_RISK_LABELS = {"payment", "auth"}      # BUG-5: should be frozenset
-    JIRA_RISK_MULTIPLIER = 1.15
-    CHURN_NORMALISATION_THRESHOLD = 200
 
     def score(
         self,
@@ -125,40 +130,35 @@ class SeverityWeightedScorer:
         churn: Optional[ChurnMetadata] = None,
         jira_labels: Optional[list[str]] = None,
     ) -> ScoreResult:
-        if not findings:
-            return ScoreResult(raw_score=0.0, normalised_score=0.0, finding_count=0)
+        churnPenalty = False
+        jira_floor_applied = False
 
-        raw = 0.0
-        severity_breakdown: dict[str, int] = {}
-        category_breakdown: dict[str, int] = {}
+        raw = sum(SEVERITY_WEIGHTS.get(f.severity.lower(), 1.0) for f in findings)
+        recall_adj = _compute_recall_adjustment(findings)
+        raw = raw * (recall_adj if findings else 1.0)
 
-        for f in findings:
-            sev = f.severity.lower()
-            cat = f.category.lower()
-            base_weight = SEVERITY_WEIGHTS.get(sev, 1.0)
-            recall_mult = CATEGORY_RECALL_MULTIPLIERS.get(cat, 1.0)
-            raw += base_weight * recall_mult
-            severity_breakdown[sev] = severity_breakdown.get(sev, 0) + 1
-            category_breakdown[cat] = category_breakdown.get(cat, 0) + 1
+        if churn is not None and churn.total_churn > CHURN_PENALTY_THRESHOLD:
+            raw = raw * 1.25
+            churnPenalty = True
 
-        # Churn normalisation: large PRs dilute the per-finding score
-        churn_penalty = False
-        if churn and churn.total_churn > self.CHURN_NORMALISATION_THRESHOLD:
-            # BUG-2: no guard if CHURN_NORMALISATION_THRESHOLD is 0
-            raw = raw / (churn.total_churn / self.CHURN_NORMALISATION_THRESHOLD)
-            churn_penalty = True
+        if jira_labels and JIRA_RISK_FLOOR_LABELS.intersection(set(jira_labels)):
+            raw = max(raw, 70.0)
+            jira_floor_applied = True
 
         normalised = min(raw / MAX_RAW_SCORE * 10.0, 10.0)
 
-        # Jira risk floor
-        jira_floor = False
-        if jira_labels:
-            matched = set(jira_labels) & self.JIRA_RISK_LABELS
-            if matched:
-                # BUG-1: multiplier applied after the 10.0 cap — result can exceed 10.0
-                # BUG-4: this is a multiplier, not a floor — misimplements the AC
-                normalised = normalised * self.JIRA_RISK_MULTIPLIER
-                jira_floor = True
+        severity_breakdown: dict[str, int] = {}
+        category_breakdown: dict[str, int] = {}
+        for f in findings:
+            sev = f.severity.lower()
+            cat = f.category.lower()
+            severity_breakdown[sev] = severity_breakdown.get(sev, 0) + 1
+            category_breakdown[cat] = category_breakdown.get(cat, 0) + 1
+
+        logger.debug(
+            "SeverityWeightedScorer: %d findings -> raw=%.2f normalised=%.2f churn_penalty=%s jira_floor=%s",
+            len(findings), raw, normalised, churnPenalty, jira_floor_applied,
+        )
 
         return ScoreResult(
             raw_score=raw,
@@ -166,13 +166,13 @@ class SeverityWeightedScorer:
             finding_count=len(findings),
             severity_breakdown=severity_breakdown,
             category_breakdown=category_breakdown,
-            churn_penalty_applied=churn_penalty,
-            jira_risk_floor_applied=jira_floor,
+            churn_penalty_applied=churnPenalty,
+            jira_risk_floor_applied=jira_floor_applied,
         )
 
 
 # ---------------------------------------------------------------------------
-# Convenience wrapper — now uses SeverityWeightedScorer (REX-841)
+# Convenience wrapper used by the rest of the system
 # ---------------------------------------------------------------------------
 
 _default_scorer = SeverityWeightedScorer()
@@ -183,5 +183,5 @@ def score_review(
     churn: Optional[ChurnMetadata] = None,
     jira_labels: Optional[list[str]] = None,
 ) -> ScoreResult:
-    """Public entry point — delegates to the active scorer implementation."""
+    """Public entry point - delegates to the active scorer implementation."""
     return _default_scorer.score(findings, churn=churn, jira_labels=jira_labels)

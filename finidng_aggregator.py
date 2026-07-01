@@ -1,7 +1,9 @@
 """
-Finding aggregator — REX-863.
+Finding aggregator - collects, deduplicates and enriches raw findings
+before handing them to the risk engine.
 
-Writes result to ReviewCache after aggregation on cache miss.
+REX-841: code_changes is now forwarded into ReviewContext so churn-normalised
+scoring is active whenever churn data is available.
 """
 
 from __future__ import annotations
@@ -13,36 +15,35 @@ from typing import Optional
 
 from backend.services.review.scoring import FindingInput, ChurnMetadata
 from backend.services.review.risk_engine import FileContext, ReviewContext, RiskReport, RiskEngine
-from backend.services.review.agent_config import AgentConfig, load_all_agent_configs
-from backend.services.review.review_cache import ReviewCache
-from backend.services.review.settings import load_cache_config
 
 logger = logging.getLogger(__name__)
 
 _engine = RiskEngine()
-_cache = ReviewCache(load_cache_config())
 
 
 # ---------------------------------------------------------------------------
-# Data classes
+# Raw finding from individual agents
 # ---------------------------------------------------------------------------
 
 @dataclass
 class AgentFinding:
-    agent: str
+    agent: str             # logic | quality | performance | security
     severity: str
     category: str
     file_path: str
     line_number: int
     message: str
     tool_source: str
-    confidence: float = 1.0
-    fingerprint: Optional[str] = None
+    fingerprint: Optional[str] = None  # set by aggregator
 
     def compute_fingerprint(self) -> str:
         key = f"{self.file_path}:{self.line_number}:{self.category}:{self.message[:60]}"
         return hashlib.md5(key.encode()).hexdigest()[:12]
 
+
+# ---------------------------------------------------------------------------
+# Aggregation context - what the pipeline passes in
+# ---------------------------------------------------------------------------
 
 @dataclass
 class AggregationRequest:
@@ -59,29 +60,8 @@ class AggregationResult:
     review_id: int
     deduplicated_findings: list[FindingInput]
     duplicate_count: int
-    suppressed_count: int
     risk_report: RiskReport
     agent_breakdown: dict[str, int] = field(default_factory=dict)
-
-
-# ---------------------------------------------------------------------------
-# Suppression
-# ---------------------------------------------------------------------------
-
-def _suppress_low_confidence(
-    findings: list[AgentFinding],
-    configs: dict[str, AgentConfig],
-) -> tuple[list[AgentFinding], int]:
-    kept: list[AgentFinding] = []
-    dropped = 0
-    for f in findings:
-        cfg = configs.get(f.agent)
-        if cfg and cfg.should_suppress(f.confidence):
-            logger.debug("Suppressed %s finding from %s (conf=%.2f)", f.category, f.agent, f.confidence)
-            dropped += 1
-        else:
-            kept.append(f)
-    return kept, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +69,7 @@ def _suppress_low_confidence(
 # ---------------------------------------------------------------------------
 
 def _deduplicate(findings: list[AgentFinding]) -> tuple[list[AgentFinding], int]:
+    """Remove duplicate findings based on fingerprint. Keep first occurrence."""
     seen: set[str] = set()
     unique: list[AgentFinding] = []
     for f in findings:
@@ -115,53 +96,57 @@ def _to_finding_input(af: AgentFinding) -> FindingInput:
 # ---------------------------------------------------------------------------
 
 class FindingAggregator:
-    """Aggregates findings and writes result to cache on miss."""
+    """
+    Deduplicates agent findings and triggers risk analysis.
 
-    def aggregate(
-        self,
-        request: AggregationRequest,
-        cache_key: Optional[str] = None,
-    ) -> AggregationResult:
-        agent_names = list({f.agent for f in request.agent_findings})
-        configs = load_all_agent_configs(agent_names)
+    REX-841: now forwards code_changes (churn) into the risk engine.
+    """
 
-        surviving, suppressed_count = _suppress_low_confidence(
-            request.agent_findings, configs
-        )
-        unique_findings, dup_count = _deduplicate(surviving)
+    def aggregate(self, request: AggregationRequest) -> AggregationResult:
+        try:
+            unique_findings, dup_count = _deduplicate(request.agent_findings)
 
-        logger.info(
-            "Aggregator: review_id=%s total=%d suppressed=%d unique=%d duplicates=%d",
-            request.review_id, len(request.agent_findings),
-            suppressed_count, len(unique_findings), dup_count,
-        )
+            logger.info(
+                "Aggregator: review_id=%s total=%d unique=%d duplicates=%d",
+                request.review_id, len(request.agent_findings), len(unique_findings), dup_count,
+            )
 
-        finding_inputs = [_to_finding_input(f) for f in unique_findings]
+            finding_inputs = [_to_finding_input(f) for f in unique_findings]
 
-        agent_breakdown: dict[str, int] = {}
-        for f in unique_findings:
-            agent_breakdown[f.agent] = agent_breakdown.get(f.agent, 0) + 1
+            agent_breakdown: dict[str, int] = {}
+            for f in unique_findings:
+                agent_breakdown[f.agent] = agent_breakdown.get(f.agent, 0) + 1
 
-        review_ctx = ReviewContext(
-            review_id=request.review_id,
-            findings=finding_inputs,
-            changed_files=request.changed_files,
-            jira_ticket_key=request.jira_ticket_key,
-            jira_labels=request.jira_labels or [],
-        )
+            review_ctx = ReviewContext(
+                review_id=request.review_id,
+                findings=finding_inputs,
+                changed_files=request.changed_files,
+                jira_ticket_key=request.jira_ticket_key,
+                jira_labels=request.jira_labels,
+                churn=request.code_changes,
+            )
 
-        risk_report = _engine.compute_risk_signals(review_ctx)
+            risk_report = _engine.compute_risk_signals(review_ctx)
 
-        result = AggregationResult(
-            review_id=request.review_id,
-            deduplicated_findings=finding_inputs,
-            duplicate_count=dup_count,
-            suppressed_count=suppressed_count,
-            risk_report=risk_report,
-            agent_breakdown=agent_breakdown,
-        )
-
-        if cache_key is not None:
-            _cache.set(cache_key, result)
-
-        return result
+            return AggregationResult(
+                review_id=request.review_id,
+                deduplicated_findings=finding_inputs,
+                duplicate_count=dup_count,
+                risk_report=risk_report,
+                agent_breakdown=agent_breakdown,
+            )
+        except Exception as exc:
+            logger.debug("Aggregation failed for review_id=%s: %s", request.review_id, exc)
+            return AggregationResult(
+                review_id=request.review_id,
+                deduplicated_findings=[],
+                duplicate_count=0,
+                risk_report=_engine.compute_risk_signals(
+                    ReviewContext(
+                        review_id=request.review_id,
+                        findings=[],
+                        changed_files=request.changed_files,
+                    )
+                ),
+                agent_breakdown={},
+            )

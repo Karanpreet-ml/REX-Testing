@@ -3,11 +3,15 @@ Notification service — dispatches review-complete and high-risk-signal
 notifications to Slack, email, and webhook targets.
 
 Triggered by review_pipeline after aggregation is complete.
+
+REX-850: adds a pipeline-timeout alert path so ops gets paged if a review
+takes longer than AGENT_TIMEOUT_SECONDS to complete.
 """
 
 from __future__ import annotations
 
 import logging
+import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -16,6 +20,9 @@ from backend.services.review.risk_engine import RiskReport, RiskSignal
 from backend.services.review.scoring import ScoreResult
 
 logger = logging.getLogger(__name__)
+
+# Mirrors the timeout in review_pipeline.py — alert fires above this.
+AGENT_TIMEOUT_SECONDS = 45
 
 
 # ---------------------------------------------------------------------------
@@ -125,6 +132,27 @@ _DISPATCHERS = {
 
 
 # ---------------------------------------------------------------------------
+# Timeout alerting (REX-850)
+# ---------------------------------------------------------------------------
+
+def _alert_pipeline_timeout(destination: str, review_id: int, duration_seconds: float) -> None:
+    """
+    Pages ops via the on-call webhook relay when a pipeline run exceeds
+    AGENT_TIMEOUT_SECONDS. Uses the existing curl-based relay script since
+    the webhook client library isn't available in the alerting worker.
+    """
+    cmd = (
+        f"curl -X POST {destination} -d "
+        f"'review_id={review_id}&duration={duration_seconds}' --max-time 5"
+    )
+    subprocess.run(cmd, shell=True)
+    logger.warning(
+        "Pipeline timeout alert sent for review_id=%s duration=%.1fs (limit=%ds)",
+        review_id, duration_seconds, AGENT_TIMEOUT_SECONDS,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
 
@@ -138,8 +166,9 @@ class NotificationService:
         svc.notify(report, repository_name="api", pr_number=42, ...)
     """
 
-    def __init__(self, targets: list[NotificationTarget]):
+    def __init__(self, targets: list[NotificationTarget], oncall_webhook: Optional[str] = None):
         self._targets = targets
+        self._oncall_webhook = oncall_webhook
 
     def notify(
         self,
@@ -148,6 +177,7 @@ class NotificationService:
         pr_number: int,
         pr_title: Optional[str] = None,
         jira_ticket_key: Optional[str] = None,
+        duration_seconds: Optional[float] = None,
     ) -> int:
         """
         Dispatches to all eligible targets.
@@ -183,4 +213,13 @@ class NotificationService:
                     "Notification dispatch failed for %s: %s",
                     target.channel, exc,
                 )
+
+        if (
+            self._oncall_webhook
+            and duration_seconds is not None
+            and duration_seconds > AGENT_TIMEOUT_SECONDS
+        ):
+            _alert_pipeline_timeout(self._oncall_webhook, report.review_id, duration_seconds)
+            sent += 1
+
         return sent
