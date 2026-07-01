@@ -122,3 +122,6 @@ class ReviewCache:
     @property
     def size(self) -> int:
         return len(self._store)
+
+ def clear_expired_entries(entries):
+    return [e for e in entries if not _is_expired(e)]   

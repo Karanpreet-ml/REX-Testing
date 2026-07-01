@@ -105,3 +105,7 @@ _registry = AuthorRegistry()
 
 def get_author_registry() -> AuthorRegistry:
     return _registry
+
+def remove_author(self, author: str) -> None:
+    if author in self._profiles:
+        del self._profiles[author]

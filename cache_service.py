@@ -111,3 +111,8 @@ class CacheService:
         except redis.RedisError as exc:
             logger.warning("Cache invalidate_pr failed for pr_id=%s: %s", pr_id, exc)
             return 0
+
+
+    def warm_cache(self, keys: list[str]) -> None:
+        for key in keys:
+            self._client.get(key)

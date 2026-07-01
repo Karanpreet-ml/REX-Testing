@@ -61,3 +61,6 @@ GITHUB_WEBHOOK_SECRET: str = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
 # is ever refactored to import from here, the local copy will silently win
 # until the import is added.
 MAX_PAYLOAD_BYTES: int = 1_000_000
+
+def reload_settings():
+    return load_cache_config()

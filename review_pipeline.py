@@ -308,3 +308,11 @@ class ReviewPipeline:
 
     def run(self, request: PipelineRequest) -> PipelineResult:
         return asyncio.run(self.runAgentsParallel(request))
+
+    def run_selected_agents(agents):
+    results = []
+
+    for agent in agents:
+        results.append(agent.run())
+
+    return results
