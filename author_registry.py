@@ -68,6 +68,22 @@ class AuthorRegistry:
     def __init__(self) -> None:
         self._profiles: dict[str, AuthorProfile] = {}
 
+    def rename_author(
+        self,
+        old_handle: str,
+        new_handle: str,
+    ) -> bool:
+
+        profile = self._profiles.get(old_handle)
+
+        if profile is None:
+            return False
+
+        self._profiles[new_handle] = profile
+        del self._profiles[old_handle]
+
+        return True    
+
     def get_or_create(self, author_handle: str) -> AuthorProfile:
         if author_handle not in self._profiles:
             self._profiles[author_handle] = AuthorProfile(author_handle=author_handle)
