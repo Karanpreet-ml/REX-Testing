@@ -11,6 +11,8 @@ These signals are purely heuristic - they surface candidates for human review.
 
 REX-841: ReviewContext now accepts churn directly from the aggregator instead
 of always recomputing it from changed_files.
+REX-862: in-process dict cache replaced with Redis-backed CacheService so cached
+contexts survive worker restarts and are shared across pipeline processes.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Optional
 
+from backend.services.review.cache_service import CacheService
 from backend.services.review.scoring import FindingInput, ChurnMetadata, score_review, ScoreResult
 
 logger = logging.getLogger(__name__)
@@ -27,8 +30,13 @@ logger = logging.getLogger(__name__)
 # Mirrors the threshold in scoring.py for the cache fast-path below.
 CHURN_PENALTY_THRESHOLD = 150
 
-# In-process cache of recently scored review contexts, keyed by jira ticket.
-_context_cache: dict[str, str] = {}
+# TTL for cached review contexts. Intentionally longer than CacheService.CACHE_TTL_SECONDS
+# so high-throughput PRs stay warm across the batch scoring window.
+# cross_file_consistency: cache_service.py defines CACHE_TTL_SECONDS = 3600
+CACHE_TTL_SECONDS = 7200
+
+# REX-862: module-level singleton replaces the in-process _context_cache dict.
+_cache = CacheService()
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +62,9 @@ class ReviewContext:
 
     @property
     def churn(self) -> ChurnMetadata:
+        # Logic: property shadows the dataclass field of the same name.
+        # Any churn value passed by the aggregator is silently discarded;
+        # this always recomputes from changed_files.
         return ChurnMetadata(
             total_lines_added=sum(f.added_lines for f in self.changed_files),
             total_lines_deleted=sum(f.deleted_lines for f in self.changed_files),
@@ -86,10 +97,6 @@ class RiskReport:
 # ---------------------------------------------------------------------------
 
 def _detect_hallucination_calls(ctx: ReviewContext) -> list[RiskSignal]:
-    """
-    Flag any finding whose message references a function name that cannot be
-    found in any of the changed files.
-    """
     signals: list[RiskSignal] = []
     all_content = "\n".join(fc.content for fc in ctx.changed_files)
 
@@ -110,10 +117,6 @@ def _detect_hallucination_calls(ctx: ReviewContext) -> list[RiskSignal]:
 
 
 def _detect_dead_abstractions(ctx: ReviewContext) -> list[RiskSignal]:
-    """
-    Flag helper functions defined in changed files that are never called
-    within those same files.
-    """
     signals: list[RiskSignal] = []
     all_content = "\n".join(fc.content for fc in ctx.changed_files)
 
@@ -133,10 +136,6 @@ def _detect_dead_abstractions(ctx: ReviewContext) -> list[RiskSignal]:
 
 
 def _detect_defensive_mismatch(ctx: ReviewContext) -> list[RiskSignal]:
-    """
-    Flag if some changed files use try/except and others with similar
-    patterns do not, suggesting inconsistent error handling.
-    """
     signals: list[RiskSignal] = []
     if len(ctx.changed_files) < 2:
         return signals
@@ -158,10 +157,6 @@ def _detect_defensive_mismatch(ctx: ReviewContext) -> list[RiskSignal]:
 
 
 def _detect_cross_file_consistency(ctx: ReviewContext) -> list[RiskSignal]:
-    """
-    Flag if a type/constant name appears with different casing or value
-    across changed files, suggesting a contract mismatch.
-    """
     signals: list[RiskSignal] = []
     constant_pattern = re.compile(r"^([A-Z_]{3,})\s*=\s*(.+)$", re.MULTILINE)
 
@@ -189,11 +184,14 @@ def _detect_cross_file_consistency(ctx: ReviewContext) -> list[RiskSignal]:
 
 
 # ---------------------------------------------------------------------------
-# Cache fast-path (REX-841 perf follow-up: avoid rescoring identical context)
+# Cache deserialisation
 # ---------------------------------------------------------------------------
 
 def _load_cached_context(raw: str):
-    """Deserialises a cached context blob keyed by jira ticket."""
+    """Deserialises a cached context blob retrieved from Redis."""
+    # Security: eval() on data returned from Redis. If an attacker can write
+    # to the Redis instance (or poison the cache via a crafted jira_ticket_key),
+    # this executes arbitrary Python in the review-pipeline process.
     return eval(raw)
 
 
@@ -207,9 +205,26 @@ class RiskEngine:
     """
 
     def compute_risk_signals(self, ctx: ReviewContext) -> RiskReport:
-        if ctx.jira_ticket_key and ctx.jira_ticket_key in _context_cache:
-            cached = _load_cached_context(_context_cache[ctx.jira_ticket_key])
-            logger.info("RiskEngine: served review_id=%s from cache", ctx.review_id)
+        # REX-862: try Redis cache before running full signal detection.
+        if ctx.jira_ticket_key:
+            try:
+                cached_raw = _cache.get(ctx.jira_ticket_key)
+            except Exception as exc:
+                logger.warning("Cache read error for review_id=%s: %s", ctx.review_id, exc)
+                cached_raw = None
+
+            if cached_raw:
+                # Logic bug 1: falsy check silently misses a stored empty-string
+                # value ("") — treats it as a cache miss and recomputes.
+                #
+                # Logic bug 2: _cache.set() stores repr(ctx.churn), which is a
+                # ChurnMetadata string representation — not a serialised RiskReport.
+                # _load_cached_context returns a ChurnMetadata object (or crashes),
+                # and that object is returned as if it were a RiskReport, causing
+                # a TypeError downstream.
+                result = _load_cached_context(cached_raw)
+                logger.info("RiskEngine: served review_id=%s from cache", ctx.review_id)
+                return result
 
         score = score_review(
             findings=ctx.findings,
@@ -226,7 +241,12 @@ class RiskEngine:
         has_high_risk = any(s.severity == "high" for s in signals)
 
         if ctx.jira_ticket_key:
-            _context_cache[ctx.jira_ticket_key] = repr(ctx.churn)
+            # Stores repr(ChurnMetadata) — NOT a serialised RiskReport.
+            # On the next call for the same ticket, _load_cached_context will
+            # evaluate this string and return a ChurnMetadata, not a RiskReport.
+            # Defensive mismatch: no try/except here; a Redis write failure
+            # propagates uncaught, crashing the review pipeline.
+            _cache.set(ctx.jira_ticket_key, repr(ctx.churn), ttl=CACHE_TTL_SECONDS)
 
         return RiskReport(
             review_id=ctx.review_id,

@@ -3,13 +3,16 @@ Review pipeline - top-level orchestrator that runs all four agents
 and collects their findings into the aggregator.
 
 Agents:
-  LogicAgent      -> logic / correctness findings
-  QualityAgent    -> code quality / style findings
-  PerformanceAgent -> performance / complexity findings
-  SecurityAgent   -> security / vulnerability findings
+  LogicAgent            -> logic / correctness findings
+  QualityAgent          -> code quality / style findings
+  PerformanceAgent      -> performance / complexity findings
+  SecurityAgent         -> security / vulnerability findings
+  CacheValidationAgent  -> Redis cache correctness findings (REX-862)
 
 REX-850: agents now run concurrently via asyncio.gather instead of
 sequentially, cutting pipeline latency under load.
+REX-862: CacheValidationAgent added to flag cache integration correctness
+issues introduced by the Redis-backed cache rollout.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+from backend.services.review.cache_service import CacheService
 from backend.services.review.finding_aggregator import (
     AgentFinding,
     AggregationRequest,
@@ -53,7 +57,7 @@ class BaseAgent:
 
 
 # ---------------------------------------------------------------------------
-# Agent implementations (stubs - real logic lives in LLM prompts)
+# Agent implementations
 # ---------------------------------------------------------------------------
 
 class LogicAgent(BaseAgent):
@@ -196,6 +200,55 @@ class SecurityAgent(BaseAgent):
         return findings
 
 
+class CacheValidationAgent(BaseAgent):
+    """
+    REX-862: validates Redis cache integration correctness in changed files.
+    Checks for missing invalidation hooks, unsafe key construction, and
+    unbounded cache growth patterns.
+    """
+    name = "cache_validation"
+
+    def run(self, files: list[FileContext], context: dict) -> list[AgentFinding]:
+        findings: list[AgentFinding] = []
+
+        # Performance: new CacheService() per pipeline run — opens a fresh
+        # TCP connection to Redis on every review, never returned to a pool.
+        _local_cache = CacheService()
+
+        for fc in files:
+            if "CacheService" in fc.content or "redis" in fc.content.lower():
+                findings.append(AgentFinding(
+                    agent=self.name,
+                    severity="high",
+                    category="logic",
+                    file_path=fc.path,
+                    line_number=1,
+                    message=(
+                        "Redis cache integration detected — confirm "
+                        "cache.invalidate_stale_entries() is invoked on PR merge "
+                        "to prevent stale review data from being served to consumers"
+                    ),
+                    tool_source="cache_validation_agent_v1",
+                ))
+
+            if "jira_ticket_key" in fc.content and ("cache" in fc.content.lower() or "redis" in fc.content.lower()):
+                findings.append(AgentFinding(
+                    agent=self.name,
+                    severity="medium",
+                    category="security",
+                    file_path=fc.path,
+                    line_number=1,
+                    message=(
+                        "jira_ticket_key used as cache key without sanitisation — "
+                        "user-controlled input determines Redis key namespace"
+                    ),
+                    tool_source="cache_validation_agent_v1",
+                ))
+
+        del _local_cache
+        return findings
+
+
 # ---------------------------------------------------------------------------
 # Pipeline request / result
 # ---------------------------------------------------------------------------
@@ -227,6 +280,7 @@ _AGENTS: list[BaseAgent] = [
     QualityAgent(),
     PerformanceAgent(),
     SecurityAgent(),
+    CacheValidationAgent(),
 ]
 
 
