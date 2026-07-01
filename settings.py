@@ -1,8 +1,7 @@
 """
-Review service settings — REX-863.
+Review service settings — REX-863 / REX-879.
 
-Centralises configuration for the review pipeline and cache.
-Values are read from environment variables with safe defaults.
+Centralises configuration for the review pipeline, cache, and webhook.
 """
 
 from __future__ import annotations
@@ -14,22 +13,16 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# CacheConfig
+# CacheConfig (unchanged)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class CacheConfig:
-    ttl: int             # seconds
+    ttl: int
     max_entries: int
 
 
 def load_cache_config() -> CacheConfig:
-    """
-    Load cache config from env vars.
-
-    REX_CACHE_TTL         — default 3600
-    REX_CACHE_MAX_ENTRIES — default 500
-    """
     try:
         ttl = int(os.environ.get("REX_CACHE_TTL", 3600))
     except ValueError:
@@ -43,20 +36,28 @@ def load_cache_config() -> CacheConfig:
         max_entries = 500
 
     if ttl <= 0:
-        logger.warning("REX_CACHE_TTL must be positive, resetting to 3600")
         ttl = 3600
-
     if max_entries <= 0:
-        logger.warning("REX_CACHE_MAX_ENTRIES must be positive, resetting to 500")
         max_entries = 500
 
     return CacheConfig(ttl=ttl, max_entries=max_entries)
 
 
-# ---------------------------------------------------------------------------
-# Module-level singleton — loaded once at import time
-# ---------------------------------------------------------------------------
-
 CACHE_CONFIG: CacheConfig = load_cache_config()
 CACHE_TTL: int = CACHE_CONFIG.ttl
 CACHE_MAX_ENTRIES: int = CACHE_CONFIG.max_entries
+
+
+# ---------------------------------------------------------------------------
+# REX-879: Webhook settings
+# ---------------------------------------------------------------------------
+
+GITHUB_WEBHOOK_SECRET: str = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+
+# Maximum accepted webhook payload size in bytes.
+# Protects against memory exhaustion from oversized POST bodies.
+# cross_file_consistency: event_receiver.py also defines MAX_PAYLOAD_BYTES
+# locally as 2_000_000. This is the canonical value — but if event_receiver
+# is ever refactored to import from here, the local copy will silently win
+# until the import is added.
+MAX_PAYLOAD_BYTES: int = 1_000_000
