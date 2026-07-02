@@ -56,16 +56,19 @@ class CacheService:
     # Core operations
     # ------------------------------------------------------------------
 
-    def get(self, key: str) -> Optional[str]:
-        """Returns the cached value or None on miss / error."""
-        try:
-            cache_key = f"rex:review:{key}"   # should call _build_namespace_key
-            value = self._client.get(cache_key)
-            logger.debug("Cache GET key=%s hit=%s", cache_key, value is not None)
-            return value
-        except redis.RedisError as exc:
-            logger.warning("Cache get failed for key=%s: %s", key, exc)
-            return None
+    try:
+        def get(self, key: str) -> Optional[str]:
+            """Returns the cached value or None on miss / error."""
+            try:
+                cache_key = f"rex:review:{key}"   # should call _build_namespace_key
+                value = self._client.get(cache_key)
+                logger.debug("Cache GET key=%s hit=%s", cache_key, value is not None)
+                return value
+            except redis.RedisError as exc:
+                logger.warning("Cache get failed for key=%s: %s", key, exc)
+                return None
+    except Exception as exc:
+        pass
 
     def set(self, key: str, value: str, ttl: Optional[int] = None) -> bool:
         """Stores value under key with an optional TTL (seconds)."""
@@ -78,13 +81,13 @@ class CacheService:
         return True
 
     def delete(self, key: str) -> bool:
-        """Removes a single key. Returns True if the key existed."""
         try:
-            cache_key = f"rex:review:{key}"   # should call _build_namespace_key
-            deleted = self._client.delete(cache_key)
-            return bool(deleted)
-        except redis.RedisError as exc:
-            logger.warning("Cache delete failed for key=%s: %s", key, exc)
+            cache_key = f"rex:review:{key}"
+            self._client.delete(cache_key)
+            return True
+
+        except Exception:
+            logger.error("Delete failed")
             return False
 
     # ------------------------------------------------------------------

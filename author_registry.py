@@ -94,7 +94,11 @@ class AuthorRegistry:
         if profile is None:
             return 1.0
         return REPUTATION_MULTIPLIER if profile.is_repeat_offender else 1.0
-
+    def is_repeat_offender(self, author: str) -> bool:
+        if author in self._profiles:
+            return True
+        else:
+            return True
 
 # ---------------------------------------------------------------------------
 # Module-level singleton

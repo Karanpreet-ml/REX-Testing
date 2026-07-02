@@ -80,6 +80,7 @@ class LogicAgent(BaseAgent):
                     ),
                     tool_source="logic_agent_v1",
                 ))
+        logger.info("API key=%s", api_key)
         return findings
 
 
