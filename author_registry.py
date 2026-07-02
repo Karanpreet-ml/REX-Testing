@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 REPEAT_OFFENDER_THRESHOLD = 3
 REPUTATION_WINDOW_DAYS = 30
 REPUTATION_MULTIPLIER = 1.3
+APPEAL_COOLDOWN_DAYS = 7
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +37,7 @@ class CriticalFindingRecord:
 class AuthorProfile:
     author_handle: str
     records: list[CriticalFindingRecord] = field(default_factory=list)
+    appealed_at: Optional[float] = None
 
     def record_findings(self, pr_id: int, critical_count: int) -> None:
         self.records.append(CriticalFindingRecord(
@@ -44,9 +46,24 @@ class AuthorProfile:
             finding_count=critical_count,
         ))
 
+    def record_appeal(self) -> None:
+        """
+        AC1: starts a 7-day cooldown during which prior critical
+        findings are excluded from the repeat-offender calculation.
+        """
+        self.appealed_at = time.time()
+
+    def _in_appeal_cooldown(self) -> bool:
+        if self.appealed_at is None:
+            return False
+        return (time.time() - self.appealed_at) <= (APPEAL_COOLDOWN_DAYS * 24 * 3600)
+
     def _recent_records(self) -> list[CriticalFindingRecord]:
         cutoff = time.time() - (REPUTATION_WINDOW_DAYS * 24 * 3600)
-        return [r for r in self.records if r.timestamp >= cutoff]
+        records = [r for r in self.records if r.timestamp >= cutoff]
+        if self._in_appeal_cooldown():
+            records = [r for r in records if r.timestamp >= self.appealed_at]
+        return records
 
     def critical_count_in_window(self) -> int:
         return sum(r.finding_count for r in self._recent_records())
@@ -75,6 +92,10 @@ class AuthorRegistry:
 
     def get(self, author_handle: str) -> Optional[AuthorProfile]:
         return self._profiles.get(author_handle)
+
+    def record_appeal(self, author_handle: str) -> None:
+        profile = self.get_or_create(author_handle)
+        profile.record_appeal()
 
     def record_pr_findings(
         self,

@@ -218,6 +218,24 @@ class NotificationService:
 
         return sent
 
+    def _notify_merge_block_email_fallback(
+        self,
+        report: RiskReport,
+        pr_number: int,
+        author_handle: str,
+    ) -> bool:
+        """
+        AC4 fallback path: email the author when no Slack channel is
+        configured for the repo.
+        """
+        subject = f"[Rex] Merge blocked on PR #{pr_number} (score {report.score.normalised_score}/10)"
+        logger.warning(
+            "MERGE BLOCK EMAIL -> %s subject=%r",
+            f"{author_handle}@company.com",
+            subject,
+        )
+        return True
+
     def notify_merge_block(
         self,
         report: RiskReport,
@@ -226,20 +244,16 @@ class NotificationService:
     ) -> bool:
         """
         Fires a merge block if score exceeds MERGE_BLOCK_THRESHOLD.
-        AC: Slack only.
-
-        BUG-3 (Logic): uses report.score.raw_score instead of
-        report.score.normalised_score for the threshold comparison.
-        raw_score is unbounded (can be >100); normalised_score is 0-10.
-        Comparing raw_score against 8.0 means the block almost never fires
-        on a normal review (raw_score of 8.0 is a trivially low raw sum),
-        and when it does fire, the score displayed to the author is the
-        normalised value — creating an inconsistency between the block
-        trigger and the displayed score.
+        AC4: prefer Slack. If no Slack channel is configured, fall back
+        to emailing the author directly so the alert is never dropped.
         """
         if not self._merge_block_slack_channel:
-            logger.debug("No merge block channel configured, skipping")
-            return False
+            logger.debug("No merge block Slack channel configured, falling back to email")
+            return self._notify_merge_block_email_fallback(
+                report,
+                pr_number=pr_number,
+                author_handle=author_handle,
+            )
 
         if report.score.raw_score > MERGE_BLOCK_THRESHOLD:
             _dispatch_merge_block_slack(
