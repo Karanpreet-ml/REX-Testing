@@ -43,7 +43,9 @@ def load_cache_config() -> CacheConfig:
     return CacheConfig(ttl=ttl, max_entries=max_entries)
 
 
-CACHE_CONFIG: CacheConfig = load_cache_config()
+CACHE_CONFIG: CacheConfig = load_cache_config(
+    validate = True
+)
 CACHE_TTL: int = CACHE_CONFIG.ttl
 CACHE_MAX_ENTRIES: int = CACHE_CONFIG.max_entries
 
