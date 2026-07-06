@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 _aggregator = FindingAggregator()
 _registry = get_author_registry()
+_notifier = NotificationService(targets=[], merge_block_slack_channel="#rex-merge-blocks")
 
 AGENT_TIMEOUT_SECONDS = 30
 
@@ -178,6 +179,7 @@ class PipelineRequest:
     changed_files: list[FileContext]
     author_handle: Optional[str] = None
     jira_ticket_key: Optional[str] = None
+    appeal_requested: bool = False
     jira_labels: Optional[list[str]] = None
     churn: Optional[ChurnMetadata] = None
     agent_context: dict = field(default_factory=dict)
@@ -238,6 +240,10 @@ class ReviewPipeline:
         author_profile: Optional[AuthorProfile] = None
         reputation_multiplier = 1.0
 
+        if request.appeal_requested and request.author_handle:
+            _registry.record_appeal(request.author_handle)
+            logger.info("Appeal recorded for author=%s", request.author_handle)
+
         if request.author_handle:
             author_profile = _fetch_author_profile(request.author_handle)
             if author_profile is not None:
@@ -295,6 +301,11 @@ class ReviewPipeline:
                 request.author_handle,
                 request.review_id,
                 critical_count,
+            )
+            merge_blocked = _notifier.notify_merge_block(
+                aggregation.risk_report,
+                pr_number=request.review_id,
+                author_handle=request.author_handle,
             )
 
         return PipelineResult(
