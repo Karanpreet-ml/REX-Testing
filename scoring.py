@@ -2,7 +2,10 @@
 Review scoring service.
 
 Computes a 0–10 quality/risk score for a completed PR review.
-REX-841: Replaced FlatScorer with SeverityWeightedScorer as the default.
+Currently uses a flat severity-weight sum normalised by finding count.
+
+REX-841 will introduce SeverityWeightedScorer with churn and recall adjustments.
+REX-910 adds a repeat-offender reputation multiplier on top of the flat sum.
 """
 
 from __future__ import annotations
@@ -33,6 +36,11 @@ CATEGORY_RECALL_MULTIPLIERS: dict[str, float] = {
 
 MAX_RAW_SCORE = 100.0
 
+# AC (REX-910): the reputation multiplier applied for repeat offenders
+# must never exceed this cap, regardless of how many prior offenses
+# an author has on record.
+REPUTATION_MULTIPLIER_CAP = 1.5
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -40,8 +48,8 @@ MAX_RAW_SCORE = 100.0
 
 @dataclass
 class FindingInput:
-    severity: str
-    category: str
+    severity: str          # critical | high | medium | low
+    category: str          # security | logic | performance | style | ...
     file_path: str
     line_number: int
     tool_source: str
@@ -61,7 +69,7 @@ class ChurnMetadata:
 @dataclass
 class ScoreResult:
     raw_score: float
-    normalised_score: float
+    normalised_score: float       # 0.0 – 10.0
     finding_count: int
     severity_breakdown: dict[str, int] = field(default_factory=dict)
     category_breakdown: dict[str, int] = field(default_factory=dict)
@@ -70,22 +78,50 @@ class ScoreResult:
 
 
 # ---------------------------------------------------------------------------
-# Flat scorer (kept for reference / rollback)
+# Reputation multiplier (REX-910)
+# ---------------------------------------------------------------------------
+
+def _compute_reputation_multiplier(offense_count: int) -> float:
+    """
+    Computes the score multiplier applied when the PR author is a
+    repeat offender, based on how many prior flagged reviews they have.
+    """
+    return 1.0 + 0.15 * offense_count
+
+
+# ---------------------------------------------------------------------------
+# Flat scorer (current / main branch)
 # ---------------------------------------------------------------------------
 
 class FlatScorer:
-    """Baseline scorer — no churn or recall adjustments."""
+    """
+    Baseline scorer: sum of severity weights, normalised to 0–10.
+
+    No churn or recall adjustments (those are REX-841). REX-910 layers
+    a reputation multiplier on top of the flat sum for repeat offenders.
+    """
 
     def score(
         self,
         findings: list[FindingInput],
-        churn: Optional[ChurnMetadata] = None,
-        jira_labels: Optional[list[str]] = None,
+        churn: Optional[ChurnMetadata] = None,  # accepted but ignored until REX-841
+        jira_labels: Optional[list[str]] = None,  # accepted but ignored until REX-841
+        offense_count: int = 0,
     ) -> ScoreResult:
         if not findings:
-            return ScoreResult(raw_score=0.0, normalised_score=0.0, finding_count=0)
+            return ScoreResult(
+                raw_score=0.0,
+                normalised_score=0.0,
+                finding_count=0,
+            )
 
         raw = sum(SEVERITY_WEIGHTS.get(f.severity.lower(), 1.0) for f in findings)
+
+        if offense_count > 0:
+            multiplier = _compute_reputation_multiplier(offense_count)
+            raw = raw * multiplier
+            self._log_multiplier_applied(offense_count, multiplier)
+
         normalised = min(raw / MAX_RAW_SCORE * 10.0, 10.0)
 
         severity_breakdown: dict[str, int] = {}
@@ -95,6 +131,11 @@ class FlatScorer:
             cat = f.category.lower()
             severity_breakdown[sev] = severity_breakdown.get(sev, 0) + 1
             category_breakdown[cat] = category_breakdown.get(cat, 0) + 1
+
+        logger.debug(
+            "FlatScorer: %d findings → raw=%.2f normalised=%.2f",
+            len(findings), raw, normalised,
+        )
 
         return ScoreResult(
             raw_score=raw,
@@ -106,82 +147,19 @@ class FlatScorer:
 
 
 # ---------------------------------------------------------------------------
-# REX-841: Severity-weighted scorer
+# Convenience wrapper used by the rest of the system
 # ---------------------------------------------------------------------------
 
-class SeverityWeightedScorer:
-    """
-    REX-841: Severity-weighted scorer with churn normalisation,
-    per-category recall multipliers, and Jira risk floor.
-    """
-
-    JIRA_RISK_LABELS = {"payment", "auth"}      # BUG-5: should be frozenset
-    JIRA_RISK_MULTIPLIER = 1.15
-    CHURN_NORMALISATION_THRESHOLD = 200
-
-    def score(
-        self,
-        findings: list[FindingInput],
-        churn: Optional[ChurnMetadata] = None,
-        jira_labels: Optional[list[str]] = None,
-    ) -> ScoreResult:
-        if not findings:
-            return ScoreResult(raw_score=0.0, normalised_score=0.0, finding_count=0)
-
-        raw = 0.0
-        severity_breakdown: dict[str, int] = {}
-        category_breakdown: dict[str, int] = {}
-
-        for f in findings:
-            sev = f.severity.lower()
-            cat = f.category.lower()
-            base_weight = SEVERITY_WEIGHTS.get(sev, 1.0)
-            recall_mult = CATEGORY_RECALL_MULTIPLIERS.get(cat, 1.0)
-            raw += base_weight * recall_mult
-            severity_breakdown[sev] = severity_breakdown.get(sev, 0) + 1
-            category_breakdown[cat] = category_breakdown.get(cat, 0) + 1
-
-        # Churn normalisation: large PRs dilute the per-finding score
-        churn_penalty = False
-        if churn and churn.total_churn > self.CHURN_NORMALISATION_THRESHOLD:
-            # BUG-2: no guard if CHURN_NORMALISATION_THRESHOLD is 0
-            raw = raw / (churn.total_churn / self.CHURN_NORMALISATION_THRESHOLD)
-            churn_penalty = True
-
-        normalised = min(raw / MAX_RAW_SCORE * 10.0, 10.0)
-
-        # Jira risk floor
-        jira_floor = False
-        if jira_labels:
-            matched = set(jira_labels) & self.JIRA_RISK_LABELS
-            if matched:
-                # BUG-1: multiplier applied after the 10.0 cap — result can exceed 10.0
-                # BUG-4: this is a multiplier, not a floor — misimplements the AC
-                normalised = normalised * self.JIRA_RISK_MULTIPLIER
-                jira_floor = True
-
-        return ScoreResult(
-            raw_score=raw,
-            normalised_score=round(normalised, 2),
-            finding_count=len(findings),
-            severity_breakdown=severity_breakdown,
-            category_breakdown=category_breakdown,
-            churn_penalty_applied=churn_penalty,
-            jira_risk_floor_applied=jira_floor,
-        )
-
-
-# ---------------------------------------------------------------------------
-# Convenience wrapper — now uses SeverityWeightedScorer (REX-841)
-# ---------------------------------------------------------------------------
-
-_default_scorer = SeverityWeightedScorer()
+_default_scorer = FlatScorer()
 
 
 def score_review(
     findings: list[FindingInput],
     churn: Optional[ChurnMetadata] = None,
     jira_labels: Optional[list[str]] = None,
+    offense_count: int = 0,
 ) -> ScoreResult:
     """Public entry point — delegates to the active scorer implementation."""
-    return _default_scorer.score(findings, churn=churn, jira_labels=jira_labels)
+    return _default_scorer.score(
+        findings, churn=churn, jira_labels=jira_labels, offense_count=offense_count
+    )

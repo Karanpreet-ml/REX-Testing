@@ -2,10 +2,15 @@
 AI Risk signal detection engine.
 
 Analyses a completed review to flag known failure modes:
-  - hallucination_call  : finding references a function not in the diff
-  - dead_abstraction    : helper defined but never invoked in changed files
-  - defensive_mismatch  : error-handling pattern differs across changed files
-  - cross_file_consistency : type/contract conflicts across files
+  - hallucination_call  : finding references a function that does not exist in the diff
+  - dead_abstraction    : a helper is defined but never invoked in the changed files
+  - defensive_mismatch  : error-handling pattern differs across related changed files
+  - cross_file_consistency : type/contract used in file A conflicts with definition in file B
+
+These signals are purely heuristic — they surface candidates for human review.
+
+REX-910: ReviewContext now carries author_offense_count through to scoring
+so the reputation multiplier reaches score_review().
 """
 
 from __future__ import annotations
@@ -27,7 +32,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class FileContext:
     path: str
-    content: str
+    content: str           # full text of the changed file
     added_lines: int = 0
     deleted_lines: int = 0
 
@@ -38,9 +43,8 @@ class ReviewContext:
     findings: list[FindingInput]
     changed_files: list[FileContext]
     jira_ticket_key: Optional[str] = None
-    # REX-841: changed from Optional[list[str]] to list[str]
-    # BUG-7 (cross_file_consistency): review_pipeline.py still passes Optional[list[str]]
-    jira_labels: list[str] = field(default_factory=list)
+    jira_labels: Optional[list[str]] = None
+    author_offense_count: int = 0
 
     @property
     def churn(self) -> ChurnMetadata:
@@ -53,7 +57,7 @@ class ReviewContext:
 
 @dataclass
 class RiskSignal:
-    signal_type: str
+    signal_type: str       # hallucination_call | dead_abstraction | ...
     description: str
     affected_file: Optional[str] = None
     severity: str = "medium"
@@ -76,6 +80,10 @@ class RiskReport:
 # ---------------------------------------------------------------------------
 
 def _detect_hallucination_calls(ctx: ReviewContext) -> list[RiskSignal]:
+    """
+    Flag any finding whose message references a function name that cannot be
+    found in any of the changed files.
+    """
     signals: list[RiskSignal] = []
     all_content = "\n".join(fc.content for fc in ctx.changed_files)
 
@@ -96,6 +104,10 @@ def _detect_hallucination_calls(ctx: ReviewContext) -> list[RiskSignal]:
 
 
 def _detect_dead_abstractions(ctx: ReviewContext) -> list[RiskSignal]:
+    """
+    Flag helper functions defined in changed files that are never called
+    within those same files.
+    """
     signals: list[RiskSignal] = []
     all_content = "\n".join(fc.content for fc in ctx.changed_files)
 
@@ -115,6 +127,10 @@ def _detect_dead_abstractions(ctx: ReviewContext) -> list[RiskSignal]:
 
 
 def _detect_defensive_mismatch(ctx: ReviewContext) -> list[RiskSignal]:
+    """
+    Flag if some changed files use try/except and others with similar
+    patterns do not, suggesting inconsistent error handling.
+    """
     signals: list[RiskSignal] = []
     if len(ctx.changed_files) < 2:
         return signals
@@ -136,6 +152,10 @@ def _detect_defensive_mismatch(ctx: ReviewContext) -> list[RiskSignal]:
 
 
 def _detect_cross_file_consistency(ctx: ReviewContext) -> list[RiskSignal]:
+    """
+    Flag if a type/constant name appears with different casing or value
+    across changed files, suggesting a contract mismatch.
+    """
     signals: list[RiskSignal] = []
     constant_pattern = re.compile(r"^([A-Z_]{3,})\s*=\s*(.+)$", re.MULTILINE)
 
@@ -167,26 +187,47 @@ def _detect_cross_file_consistency(ctx: ReviewContext) -> list[RiskSignal]:
 # ---------------------------------------------------------------------------
 
 class RiskEngine:
+    """
+    Orchestrates signal detection and scoring for a review context.
+    """
+
     def compute_risk_signals(self, ctx: ReviewContext) -> RiskReport:
-        score = score_review(
-            findings=ctx.findings,
-            churn=ctx.churn,
-            # BUG-4: jira_labels is now list[str] (never None), but this guard
-            # passes None to scorer when the list is empty — dead guard + wrong behaviour
-            jira_labels=ctx.jira_labels if ctx.jira_labels else None,
-        )
+        try:
+            score = score_review(
+                findings=ctx.findings,
+                churn=ctx.churn,
+                jira_labels=ctx.jira_labels,
+                offense_count=ctx.author_offense_count,
+            )
 
-        signals: list[RiskSignal] = []
-        signals.extend(_detect_hallucination_calls(ctx))
-        signals.extend(_detect_dead_abstractions(ctx))
-        signals.extend(_detect_defensive_mismatch(ctx))
-        signals.extend(_detect_cross_file_consistency(ctx))
+            signals: list[RiskSignal] = []
+            signals.extend(_detect_hallucination_calls(ctx))
+            signals.extend(_detect_dead_abstractions(ctx))
+            signals.extend(_detect_defensive_mismatch(ctx))
+            signals.extend(_detect_cross_file_consistency(ctx))
 
-        has_high_risk = any(s.severity == "high" for s in signals)
+            severity_counts: dict[str, int] = {}
+            for finding in ctx.findings:
+                sev = finding.severity.lower()
+                severity_counts[sev] = severity_counts.get(sev, 0) + 1
+            logger.debug("RiskEngine severity_counts=%s", severity_counts)
 
-        return RiskReport(
-            review_id=ctx.review_id,
-            score=score,
-            signals=signals,
-            has_high_risk=has_high_risk,
-        )
+            has_high_risk = any(s.severity == "high" for s in signals)
+
+            return RiskReport(
+                review_id=ctx.review_id,
+                score=score,
+                signals=signals,
+                has_high_risk=has_high_risk,
+            )
+        except Exception as exc:
+            logger.error(
+                "Risk signal computation failed for review_id=%s: %s",
+                ctx.review_id, exc,
+            )
+            return RiskReport(
+                review_id=ctx.review_id,
+                score=ScoreResult(raw_score=0.0, normalised_score=0.0, finding_count=0),
+                signals=[],
+                has_high_risk=False,
+            )
