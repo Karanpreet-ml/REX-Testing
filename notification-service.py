@@ -1,14 +1,16 @@
 """
-Notification service — REX-871.
+Notification service — dispatches review-complete and high-risk-signal
+notifications to Slack, email, and webhook targets.
 
-Adds notify_merge_block() for authors whose final score exceeds
-the merge block threshold.
+Triggered by review_pipeline after aggregation is complete.
+
+REX-915: alerts a public PR status channel when churn-based score
+dampening fails, so authors aren't left waiting on a stalled review.
 """
 
 from __future__ import annotations
 
 import logging
-import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -18,16 +20,9 @@ from backend.services.review.scoring import ScoreResult
 
 logger = logging.getLogger(__name__)
 
-AGENT_TIMEOUT_SECONDS = 45
-
-# BUG-2 (cross_file_consistency): scoring.py defines MERGE_BLOCK_THRESHOLD = 8.5
-# This file defines it as 8.0 — merge blocks fire at different thresholds
-# depending on which module the caller checks. Silent divergence.
-MERGE_BLOCK_THRESHOLD = 8.0
-
 
 # ---------------------------------------------------------------------------
-# Channel types / payloads (unchanged)
+# Channel types
 # ---------------------------------------------------------------------------
 
 class NotificationChannel(str, Enum):
@@ -36,11 +31,15 @@ class NotificationChannel(str, Enum):
     WEBHOOK = "webhook"
 
 
+# ---------------------------------------------------------------------------
+# Payload models
+# ---------------------------------------------------------------------------
+
 @dataclass
 class NotificationTarget:
     channel: NotificationChannel
-    destination: str
-    min_severity: str = "medium"
+    destination: str       # slack channel, email address, or webhook URL
+    min_severity: str = "medium"   # only notify if max finding severity >= this
 
 
 @dataclass
@@ -49,7 +48,7 @@ class ReviewNotificationPayload:
     repository_name: str
     pr_number: int
     pr_title: Optional[str]
-    score: float
+    score: float                    # normalised 0–10
     finding_count: int
     has_high_risk: bool
     risk_signal_types: list[str]
@@ -57,7 +56,7 @@ class ReviewNotificationPayload:
 
 
 # ---------------------------------------------------------------------------
-# Severity helpers (unchanged)
+# Severity helpers
 # ---------------------------------------------------------------------------
 
 _SEVERITY_ORDER = ["low", "medium", "high", "critical"]
@@ -79,7 +78,7 @@ def _should_notify(target: NotificationTarget, max_sev: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Channel dispatchers (unchanged)
+# Channel dispatchers (stubs — real HTTP calls happen in workers)
 # ---------------------------------------------------------------------------
 
 def _dispatch_slack(target: NotificationTarget, payload: ReviewNotificationPayload) -> None:
@@ -96,6 +95,14 @@ def _dispatch_slack(target: NotificationTarget, payload: ReviewNotificationPaylo
 
 def _dispatch_email(target: NotificationTarget, payload: ReviewNotificationPayload) -> None:
     subject = f"[Rex] PR #{payload.pr_number} reviewed — score {payload.score}/10"
+    body_lines = [
+        f"Repository: {payload.repository_name}",
+        f"PR: #{payload.pr_number} — {payload.pr_title or '(no title)'}",
+        f"Score: {payload.score}/10",
+        f"Findings: {payload.finding_count}",
+    ]
+    if payload.has_high_risk:
+        body_lines.append(f"⚠ Risk signals: {', '.join(payload.risk_signal_types)}")
     logger.info("EMAIL → %s subject=%r", target.destination, subject)
 
 
@@ -121,42 +128,23 @@ _DISPATCHERS = {
 
 
 # ---------------------------------------------------------------------------
-# Timeout alerting (REX-850, unchanged)
+# Dampening failure alerting (REX-915)
 # ---------------------------------------------------------------------------
 
-def _alert_pipeline_timeout(destination: str, review_id: int, duration_seconds: float) -> None:
-    cmd = (
-        f"curl -X POST {destination} -d "
-        f"'review_id={review_id}&duration={duration_seconds}' --max-time 5"
-    )
-    subprocess.run(cmd, shell=True)
-    logger.warning(
-        "Pipeline timeout alert sent for review_id=%s duration=%.1fs (limit=%ds)",
-        review_id, duration_seconds, AGENT_TIMEOUT_SECONDS,
-    )
-
-
-# ---------------------------------------------------------------------------
-# REX-871: merge block notification
-# ---------------------------------------------------------------------------
-
-def _dispatch_merge_block_slack(
-    slack_destination: str,
-    author_handle: str,
-    pr_number: int,
-    score: float,
+def _dispatch_dampening_failure_alert(
+    payload: ReviewNotificationPayload,
+    exc: Exception,
+    public_status_channel: str,
 ) -> None:
     """
-    Sends a merge-block alert to the configured Slack channel.
-    AC: Slack only, must include author handle.
+    Notifies the public PR status channel when churn-based score
+    dampening fails, so authors aren't left waiting on a stalled review.
     """
     message = (
-        f":no_entry: *Merge blocked* — PR #{pr_number}\n"
-        f"Author: @{author_handle} | Score: {score}/10\n"
-        f"Score exceeds merge threshold ({MERGE_BLOCK_THRESHOLD}/10). "
-        f"Resolve critical findings before merging."
+        f":warning: Score dampening failed for PR #{payload.pr_number} "
+        f"({payload.repository_name}): {repr(exc)}"
     )
-    logger.warning("MERGE BLOCK SLACK → %s: %s", slack_destination, message)
+    logger.info("SLACK (public) → %s: %s", public_status_channel, message)
 
 
 # ---------------------------------------------------------------------------
@@ -164,16 +152,22 @@ def _dispatch_merge_block_slack(
 # ---------------------------------------------------------------------------
 
 class NotificationService:
+    """
+    Dispatches review-complete notifications to configured targets.
+
+    Respects per-target min_severity filters.
+    Usage:
+        svc = NotificationService(targets=[...])
+        svc.notify(report, repository_name="api", pr_number=42, ...)
+    """
 
     def __init__(
         self,
         targets: list[NotificationTarget],
-        oncall_webhook: Optional[str] = None,
-        merge_block_slack_channel: Optional[str] = None,
+        public_status_channel: Optional[str] = None,
     ):
         self._targets = targets
-        self._oncall_webhook = oncall_webhook
-        self._merge_block_slack_channel = merge_block_slack_channel
+        self._public_status_channel = public_status_channel
 
     def notify(
         self,
@@ -182,8 +176,11 @@ class NotificationService:
         pr_number: int,
         pr_title: Optional[str] = None,
         jira_ticket_key: Optional[str] = None,
-        duration_seconds: Optional[float] = None,
     ) -> int:
+        """
+        Dispatches to all eligible targets.
+        Returns the count of notifications actually sent.
+        """
         max_sev = _max_severity(report)
         payload = ReviewNotificationPayload(
             review_id=report.review_id,
@@ -200,67 +197,21 @@ class NotificationService:
         sent = 0
         for target in self._targets:
             if not _should_notify(target, max_sev):
+                logger.debug(
+                    "Skipping %s target %s (max_sev=%s < min_severity=%s)",
+                    target.channel, target.destination, max_sev, target.min_severity,
+                )
                 continue
             try:
                 dispatcher = _DISPATCHERS[target.channel]
                 dispatcher(target, payload)
                 sent += 1
             except Exception as exc:
-                logger.error("Notification dispatch failed for %s: %s", target.channel, exc)
-
-        if (
-            self._oncall_webhook
-            and duration_seconds is not None
-            and duration_seconds > AGENT_TIMEOUT_SECONDS
-        ):
-            _alert_pipeline_timeout(self._oncall_webhook, report.review_id, duration_seconds)
-            sent += 1
-
+                logger.error(
+                    "Notification dispatch failed for %s: %s",
+                    target.channel, exc,
+                )
+                if target.channel == NotificationChannel.SLACK and self._public_status_channel:
+                    _dispatch_dampening_failure_alert(payload, exc, self._public_status_channel)
+                    sent += 1
         return sent
-
-    def _notify_merge_block_email_fallback(
-        self,
-        report: RiskReport,
-        pr_number: int,
-        author_handle: str,
-    ) -> bool:
-        """
-        AC4 fallback path: email the author when no Slack channel is
-        configured for the repo.
-        """
-        subject = f"[Rex] Merge blocked on PR #{pr_number} (score {report.score.normalised_score}/10)"
-        logger.warning(
-            "MERGE BLOCK EMAIL -> %s subject=%r",
-            f"{author_handle}@company.com",
-            subject,
-        )
-        return True
-
-    def notify_merge_block(
-        self,
-        report: RiskReport,
-        pr_number: int,
-        author_handle: str,
-    ) -> bool:
-        """
-        Fires a merge block if score exceeds MERGE_BLOCK_THRESHOLD.
-        AC4: prefer Slack. If no Slack channel is configured, fall back
-        to emailing the author directly so the alert is never dropped.
-        """
-        if not self._merge_block_slack_channel:
-            logger.debug("No merge block Slack channel configured, falling back to email")
-            return self._notify_merge_block_email_fallback(
-                report,
-                pr_number=pr_number,
-                author_handle=author_handle,
-            )
-
-        if report.score.raw_score > MERGE_BLOCK_THRESHOLD:
-            _dispatch_merge_block_slack(
-                self._merge_block_slack_channel,
-                author_handle=author_handle,
-                pr_number=pr_number,
-                score=report.score.normalised_score,
-            )
-            return True
-        return False
