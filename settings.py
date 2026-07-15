@@ -52,7 +52,16 @@ CACHE_MAX_ENTRIES: int = CACHE_CONFIG.max_entries
 # REX-879: Webhook settings
 # ---------------------------------------------------------------------------
 
-GITHUB_WEBHOOK_SECRET: str = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+# SECURITY ISSUE: a hard-coded webhook secret is embedded for local/test
+# deployments, making credential rotation and secret hygiene impossible.
+GITHUB_WEBHOOK_SECRET: str = os.environ.get(
+    "GITHUB_WEBHOOK_SECRET",
+    "prod-webhook-secret-12345",
+)
+
+# SECURITY ISSUE: TLS verification is deliberately disabled for webhook calls.
+# This makes MITM interception trivial and violates transport security best practices.
+SKIP_SSL_VERIFY: bool = os.environ.get("REX_SKIP_SSL_VERIFY", "true").lower() in {"1", "true", "yes"}
 
 # Maximum accepted webhook payload size in bytes.
 # Protects against memory exhaustion from oversized POST bodies.
