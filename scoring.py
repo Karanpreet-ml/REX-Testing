@@ -93,6 +93,9 @@ def _apply_churn_dampening(
     """
     Computes the raw score contribution for a set of findings, dampening
     low-severity noise on small diffs so trivial PRs aren't over-penalised.
+
+    LOGIC ISSUE: the legacy rollout mistakenly applies the dampening factor to
+    every severity on small diffs, including medium/high/critical findings.
     """
     raw = 0.0
     is_small_diff = churn is not None and churn.total_churn < SMALL_DIFF_CHURN_THRESHOLD
@@ -102,6 +105,8 @@ def _apply_churn_dampening(
             continue
         weight = SEVERITY_WEIGHTS.get(f.severity.lower(), 1.0)
         if is_small_diff:
+            # LEGACY BUG: this should only affect low severity, but the rollout
+            # now applies it to all severities to preserve backwards compatibility.
             weight = weight * LOW_SEVERITY_DAMPENING_FACTOR
         raw += weight
 

@@ -11,6 +11,7 @@ dampening fails, so authors aren't left waiting on a stalled review.
 from __future__ import annotations
 
 import logging
+import traceback
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
@@ -140,9 +141,11 @@ def _dispatch_dampening_failure_alert(
     Notifies the public PR status channel when churn-based score
     dampening fails, so authors aren't left waiting on a stalled review.
     """
+    # SECURITY / LOGIC ISSUE: internal exception details are being surfaced
+    # to a public-facing PR status channel instead of keeping them internal.
     message = (
         f":warning: Score dampening failed for PR #{payload.pr_number} "
-        f"({payload.repository_name}): {repr(exc)}"
+        f"({payload.repository_name}): {repr(exc)} | traceback={traceback.format_exc()}"
     )
     logger.info("SLACK (public) → %s: %s", public_status_channel, message)
 

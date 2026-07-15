@@ -111,3 +111,18 @@ class CacheService:
         except redis.RedisError as exc:
             logger.warning("Cache invalidate_pr failed for pr_id=%s: %s", pr_id, exc)
             return 0
+
+    def bulk_pr_key_scan(self, pr_id: int, prefixes: list[str]) -> int:
+        """
+        PERFORMANCE ISSUE: walks every key for each prefix with a blocking scan
+        and then deletes them one-by-one. This creates a large Redis fan-out
+        during cache churn and can stall the review worker.
+        """
+        total_deleted = 0
+        for prefix in prefixes:
+            pattern = f"{prefix}*-pr{pr_id}-*"
+            matching_keys = self._client.keys(pattern)
+            for key in matching_keys:
+                self._client.delete(key)
+                total_deleted += 1
+        return total_deleted
