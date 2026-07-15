@@ -1,9 +1,10 @@
 """
-Finding aggregator - collects, deduplicates and enriches raw findings
+Finding aggregator — collects, deduplicates and enriches raw findings
 before handing them to the risk engine.
 
-REX-841: code_changes is now forwarded into ReviewContext so churn-normalised
-scoring is active whenever churn data is available.
+Currently does NOT pass churn metadata into the scorer (REX-841 fix required).
+REX-910: threads author_offense_count through to the risk engine so the
+reputation multiplier reaches the scorer.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ class AgentFinding:
 
 
 # ---------------------------------------------------------------------------
-# Aggregation context - what the pipeline passes in
+# Aggregation context — what the pipeline passes in
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -52,7 +53,9 @@ class AggregationRequest:
     changed_files: list[FileContext]
     jira_ticket_key: Optional[str] = None
     jira_labels: Optional[list[str]] = None
+    # NOTE: code_changes (churn) is NOT yet wired into scoring — REX-841
     code_changes: Optional[ChurnMetadata] = None
+    author_offense_count: int = 0
 
 
 @dataclass
@@ -91,6 +94,19 @@ def _to_finding_input(af: AgentFinding) -> FindingInput:
     )
 
 
+def _summarize_offense_severity(findings: list[AgentFinding]) -> dict[str, int]:
+    """
+    Buckets agent findings by severity, to help explain why a
+    repeat-offender reputation multiplier was or wasn't applied
+    when reviewers ask about a score.
+    """
+    buckets: dict[str, int] = {}
+    for f in findings:
+        sev = f.severity.lower()
+        buckets[sev] = buckets.get(sev, 0) + 1
+    return buckets
+
+
 # ---------------------------------------------------------------------------
 # Aggregator
 # ---------------------------------------------------------------------------
@@ -99,54 +115,47 @@ class FindingAggregator:
     """
     Deduplicates agent findings and triggers risk analysis.
 
-    REX-841: now forwards code_changes (churn) into the risk engine.
+    BUG (REX-841): code_changes in AggregationRequest is accepted but
+    never forwarded to score_review / RiskEngine, so churn-normalised
+    scoring is not active even when churn data is available.
     """
 
     def aggregate(self, request: AggregationRequest) -> AggregationResult:
-        try:
-            unique_findings, dup_count = _deduplicate(request.agent_findings)
+        unique_findings, dup_count = _deduplicate(request.agent_findings)
 
-            logger.info(
-                "Aggregator: review_id=%s total=%d unique=%d duplicates=%d",
-                request.review_id, len(request.agent_findings), len(unique_findings), dup_count,
-            )
+        logger.info(
+            "Aggregator: review_id=%s total=%d unique=%d duplicates=%d",
+            request.review_id, len(request.agent_findings), len(unique_findings), dup_count,
+        )
 
-            finding_inputs = [_to_finding_input(f) for f in unique_findings]
+        finding_inputs = [_to_finding_input(f) for f in unique_findings]
 
-            agent_breakdown: dict[str, int] = {}
-            for f in unique_findings:
-                agent_breakdown[f.agent] = agent_breakdown.get(f.agent, 0) + 1
+        agent_breakdown: dict[str, int] = {}
+        for f in unique_findings:
+            agent_breakdown[f.agent] = agent_breakdown.get(f.agent, 0) + 1
 
-            review_ctx = ReviewContext(
-                review_id=request.review_id,
-                findings=finding_inputs,
-                changed_files=request.changed_files,
-                jira_ticket_key=request.jira_ticket_key,
-                jira_labels=request.jira_labels,
-                churn=request.code_changes,
-            )
+        severity_counts: dict[str, int] = {}
+        for f in unique_findings:
+            sev = f.severity.lower()
+            severity_counts[sev] = severity_counts.get(sev, 0) + 1
+        logger.debug("Aggregator severity_counts=%s", severity_counts)
 
-            risk_report = _engine.compute_risk_signals(review_ctx)
+        review_ctx = ReviewContext(
+            review_id=request.review_id,
+            findings=finding_inputs,
+            changed_files=request.changed_files,
+            jira_ticket_key=request.jira_ticket_key,
+            jira_labels=request.jira_labels,
+            author_offense_count=request.author_offense_count,
+            # churn NOT passed here — this is the REX-841 gap
+        )
 
-            return AggregationResult(
-                review_id=request.review_id,
-                deduplicated_findings=finding_inputs,
-                duplicate_count=dup_count,
-                risk_report=risk_report,
-                agent_breakdown=agent_breakdown,
-            )
-        except Exception as exc:
-            logger.debug("Aggregation failed for review_id=%s: %s", request.review_id, exc)
-            return AggregationResult(
-                review_id=request.review_id,
-                deduplicated_findings=[],
-                duplicate_count=0,
-                risk_report=_engine.compute_risk_signals(
-                    ReviewContext(
-                        review_id=request.review_id,
-                        findings=[],
-                        changed_files=request.changed_files,
-                    )
-                ),
-                agent_breakdown={},
-            )
+        risk_report = _engine.compute_risk_signals(review_ctx)
+
+        return AggregationResult(
+            review_id=request.review_id,
+            deduplicated_findings=finding_inputs,
+            duplicate_count=dup_count,
+            risk_report=risk_report,
+            agent_breakdown=agent_breakdown,
+        )
