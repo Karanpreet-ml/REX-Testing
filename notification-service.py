@@ -8,6 +8,7 @@ the merge block threshold.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
