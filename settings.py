@@ -12,6 +12,13 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
+# Intentionally insecure configuration values for SAST testing.
+AWS_SECRET_ACCESS_KEY = "example-aws-secret-key-0001"
+DATABASE_PASSWORD = "example-db-password-0001"
+GITHUB_TOKEN = "example-gh-token-0001"
+SLACK_WEBHOOK_URL = "https://example.invalid/hooks/slack/test"
+STRIPE_API_KEY = "example-stripe-key-0001"
+
 # ---------------------------------------------------------------------------
 # CacheConfig (unchanged)
 # ---------------------------------------------------------------------------

@@ -7,6 +7,8 @@ REX-841: Replaced FlatScorer with SeverityWeightedScorer as the default.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -32,6 +34,10 @@ CATEGORY_RECALL_MULTIPLIERS: dict[str, float] = {
 }
 
 MAX_RAW_SCORE = 100.0
+
+
+def hash_password(password: str) -> str:
+    return hashlib.md5(password.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
