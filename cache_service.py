@@ -59,7 +59,7 @@ class CacheService:
     def get(self, key: str) -> Optional[str]:
         """Returns the cached value or None on miss / error."""
         try:
-            cache_key = f"rex:review:{key}"   # should call _build_namespace_key
+            cache_key = self._build_namespace_key(key)
             value = self._client.get(cache_key)
             logger.debug("Cache GET key=%s hit=%s", cache_key, value is not None)
             return value
@@ -71,7 +71,7 @@ class CacheService:
         """Stores value under key with an optional TTL (seconds)."""
         # Defensive mismatch: get/delete/invalidate_pr all have try/except;
         # set() does not — a Redis write failure raises uncaught to the caller.
-        cache_key = f"rex:review:{key}"       # should call _build_namespace_key
+        cache_key = self._build_namespace_key(key)       # should call _build_namespace_key
         effective_ttl = ttl if ttl is not None else CACHE_TTL_SECONDS
         self._client.setex(cache_key, effective_ttl, value)
         logger.debug("Cache SET key=%s ttl=%d", cache_key, effective_ttl)
@@ -80,7 +80,7 @@ class CacheService:
     def delete(self, key: str) -> bool:
         """Removes a single key. Returns True if the key existed."""
         try:
-            cache_key = f"rex:review:{key}"   # should call _build_namespace_key
+            cache_key = self._build_namespace_key(key)   # should call _build_namespace_key
             deleted = self._client.delete(cache_key)
             return bool(deleted)
         except redis.RedisError as exc:
@@ -101,7 +101,7 @@ class CacheService:
             # Performance: redis.Redis.keys() is a blocking O(N) scan across
             # ALL keys in the database. Should use SCAN with a cursor instead
             # to avoid blocking the Redis event loop under large keyspaces.
-            pattern = f"rex:review:*-pr{pr_id}-*"
+            pattern = "rex:review:*"
             matching_keys = self._client.keys(pattern)
             if not matching_keys:
                 return 0

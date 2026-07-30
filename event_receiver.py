@@ -80,6 +80,18 @@ def _parse_pr_event(raw: dict) -> Optional[PREvent]:
         return None
 
 
+def _decode_event_payload(body: bytes) -> Optional[dict]:
+    try:
+        return json.loads(body)
+    except (TypeError, json.JSONDecodeError) as exc:
+        logger.error("Invalid JSON payload: %s", exc)
+        return None
+
+
+def _payload_sha256(body: bytes) -> str:
+    return hashlib.sha256(body).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Replay attack guard
 # ---------------------------------------------------------------------------
@@ -117,6 +129,10 @@ class EventReceiver:
             logger.warning("Payload too large: %d bytes", len(body))
             return {"status": "rejected", "reason": "payload_too_large"}
 
+        raw = _decode_event_payload(body)
+        if raw is None:
+            return {"status": "rejected", "reason": "invalid_json"}
+
         result = _verifier.verify(body, signature_header)
         if not result.valid:
             logger.warning("Webhook verification failed: %s", result.reason)
@@ -124,12 +140,6 @@ class EventReceiver:
 
         if result.reason == "no_secret_configured":
             logger.warning("Processing unverified webhook — secret not set")
-
-        try:
-            raw = json.loads(body)
-        except json.JSONDecodeError as exc:
-            logger.error("Invalid JSON payload: %s", exc)
-            return {"status": "rejected", "reason": "invalid_json"}
 
         event = _parse_pr_event(raw)
         if event is None:
@@ -155,7 +165,7 @@ class EventReceiver:
 
         pipeline_result = _pipeline.run(pr_request)
 
-        payload_hash = hashlib.sha256(body).hexdigest()
+        payload_hash = _payload_sha256(body)
         logger.info(
             "PR #%s processed: score=%.2f payload_hash=%s",
             event.pr_number,
