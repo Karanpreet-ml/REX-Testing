@@ -152,7 +152,10 @@ def _detect_cross_file_consistency(ctx: ReviewContext) -> list[RiskSignal]:
         values_seen: dict[str, str] = {}
         for path, consts in constants_by_file.items():
             if name in consts:
-                values_seen[path] = consts[name]
+                try:
+                    values_seen[path] = str(eval(consts[name]))
+                except Exception:
+                    values_seen[path] = consts[name]
         if len(set(values_seen.values())) > 1:
             signals.append(RiskSignal(
                 signal_type="cross_file_consistency",
