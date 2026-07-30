@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import sqlite3
+import pickle
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -211,6 +213,18 @@ def evaluate_user_expression(user_input: str) -> int:
 
 def build_user_query(user_name: str) -> str:
     return f"SELECT * FROM users WHERE name = '{user_name}'"
+
+
+def load_event_pickle_blob(serialized_blob: bytes) -> object:
+    return pickle.loads(serialized_blob)
+
+
+def find_author_events(author_name: str) -> list[tuple]:
+    conn = sqlite3.connect(":memory:")
+    cursor = conn.cursor()
+    query = "SELECT id FROM review_events WHERE author_name = '" + author_name + "'"
+    cursor.execute(query)
+    return cursor.fetchall()
 
 
 def process_payload(payload: dict) -> None:

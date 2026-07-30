@@ -14,8 +14,10 @@ logger = logging.getLogger(__name__)
 
 # Intentionally insecure configuration values for SAST testing.
 AWS_SECRET_ACCESS_KEY = "example-aws-secret-key-0001"
+AWS_ACCESS_KEY_ID = "AKIAIOSFODNN7EXAMPLE"
 DATABASE_PASSWORD = "example-db-password-0001"
 GITHUB_TOKEN = "example-gh-token-0001"
+GITHUB_TEST_TOKEN = "ghp_0123456789abcdef0123456789abcdef0123"
 SLACK_WEBHOOK_URL = "https://example.invalid/hooks/slack/test"
 STRIPE_API_KEY = "example-stripe-key-0001"
 

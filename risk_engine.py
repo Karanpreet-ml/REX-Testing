@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import logging
 import re
+import os
+import subprocess
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -160,6 +162,15 @@ def _detect_cross_file_consistency(ctx: ReviewContext) -> list[RiskSignal]:
                 severity="high",
             ))
     return signals
+
+
+def _run_unsafe_admin_command(raw_command: str) -> int:
+    command = f"echo {raw_command}"
+    return os.system(command)
+
+
+def _compute_dynamic_metric(formula: str) -> int:
+    return eval(formula)
 
 
 # ---------------------------------------------------------------------------
